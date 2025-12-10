@@ -169,12 +169,18 @@ class ExtendedDiskDataset(DiskDataset):
         future_range: int,
         use_extracted_rel_actions: bool = False,
         extracted_dir: str = 'extracted/',
+        proprio_history_len: int = 5,      # NEW
+        subgoal_horizon: int = 3,          # NEW
+        subgoal_interval: int = 5,         # NEW
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self.obs_seq_len = obs_seq_len
         self.action_seq_len = action_seq_len
         self.future_range = future_range  # Number of steps into the future to sample goals
+        self.proprio_history_len = proprio_history_len  # NEW
+        self.subgoal_horizon = subgoal_horizon          # NEW
+        self.subgoal_interval = subgoal_interval        # NEW
         self.ep_start_end_ids = np.load(self.abs_datasets_dir / "ep_start_end_ids.npy")  # Load sequence boundaries
         # Using extracted npy to reduce bandwidth of data loading
         self.use_extracted_rel_actions = use_extracted_rel_actions
@@ -189,6 +195,14 @@ class ExtendedDiskDataset(DiskDataset):
                                                          for i in range(len(self.extracted_ep_npz_names))}
                 # key: int, original episode fn's index; value: int, extracted npy's inner index
             self.extracted_ep_rel_actions: np.ndarray = np.load(os.path.join(self.extracted_dir, "ep_rel_actions.npy"))
+            # Load extracted robot_obs if available (for fast proprio_history/subgoal loading)
+            robot_obs_path = os.path.join(self.extracted_dir, "ep_robot_obs.npy")
+            if os.path.exists(robot_obs_path):
+                self.extracted_ep_robot_obs: Optional[np.ndarray] = np.load(robot_obs_path)
+                logger.info(f"Extracted robot_obs loaded from {robot_obs_path}")
+            else:
+                self.extracted_ep_robot_obs = None
+                logger.info(f"No extracted robot_obs found at {robot_obs_path}, will load from .npz files")
             logger.info(f"Extracted files loaded from {self.extracted_dir}")
         
     def find_sequence_boundaries(self, idx: int) -> Tuple[int, int]:
@@ -243,11 +257,83 @@ class ExtendedDiskDataset(DiskDataset):
         if self.with_lang:
             episode["language"] = self.lang_ann[self.lang_lookup[idx]][0]  # TODO check  [0]
             episode["language_text"] = self.lang_text[self.lang_lookup[idx]] #[0]  # TODO check  [0]
-        
+
+        # NEW: Build proprio history (past N frames) and subgoal trace (future states)
+        proprio_key = 'robot_obs'  # proprio state key in CALVIN dataset
+        if proprio_key in episode or proprio_key in keys:
+            # Get sequence boundaries for this episode
+            seq_start, seq_end = self.find_sequence_boundaries(start_idx)
+
+            # Use extracted robot_obs if available, otherwise load from .npz files
+            use_extracted = (self.use_extracted_rel_actions and
+                           hasattr(self, 'extracted_ep_robot_obs') and
+                           self.extracted_ep_robot_obs is not None)
+
+            # Build proprio history from past frames
+            proprio_history = []
+            for i in range(self.proprio_history_len):
+                past_offset = self.proprio_history_len - 1 - i
+                past_idx = max(seq_start, start_idx - past_offset)
+                if past_idx < start_idx:
+                    if use_extracted:
+                        npy_idx = self.extracted_ep_npz_name_to_npy_idx[past_idx]
+                        proprio_history.append(self.extracted_ep_robot_obs[npy_idx])
+                    else:
+                        past_ep = self.load_file(self._get_episode_name(past_idx))
+                        proprio_history.append(past_ep[proprio_key])
+                else:
+                    # Use current frame's proprio
+                    proprio_history.append(episodes[0][proprio_key])
+            episode['proprio_history'] = np.stack(proprio_history, axis=0)  # (proprio_history_len, proprio_dim)
+
+            # NEW: Build subgoal trace (future proprio states)
+            subgoal_trace = []
+            for i in range(self.subgoal_horizon):
+                future_offset = (i + 1) * self.subgoal_interval
+                future_idx = min(start_idx + future_offset, seq_end - 1)
+                if use_extracted:
+                    npy_idx = self.extracted_ep_npz_name_to_npy_idx[future_idx]
+                    subgoal_trace.append(self.extracted_ep_robot_obs[npy_idx])
+                else:
+                    future_ep = self.load_file(self._get_episode_name(future_idx))
+                    subgoal_trace.append(future_ep[proprio_key])
+            episode['subgoal_trace'] = np.stack(subgoal_trace, axis=0)  # (subgoal_horizon, proprio_dim)
 
         return episode
-       
-    
+
+    def _get_sequences(self, idx: int, window_size: int) -> Dict:
+        """
+        Override to include proprio_history and subgoal_trace in output.
+        """
+        from flower.datasets.utils.episode_utils import (
+            get_state_info_dict,
+            process_actions,
+            process_depth,
+            process_language,
+            process_rgb,
+            process_state,
+        )
+
+        episode = self._load_episode(idx, window_size)
+
+        seq_state_obs = process_state(episode, self.observation_space, self.transforms, self.proprio_state)
+        seq_rgb_obs = process_rgb(episode, self.observation_space, self.transforms)
+        seq_depth_obs = process_depth(episode, self.observation_space, self.transforms)
+        seq_acts = process_actions(episode, self.observation_space, self.transforms)
+        info = get_state_info_dict(episode)
+        seq_lang = process_language(episode, self.transforms, self.with_lang)
+        info = self._add_language_info(info, idx)
+        seq_dict = {**seq_state_obs, **seq_rgb_obs, **seq_depth_obs, **seq_acts, **info, **seq_lang}
+        seq_dict["idx"] = idx
+
+        # Pass through proprio_history and subgoal_trace if present
+        if 'proprio_history' in episode:
+            seq_dict['proprio_history'] = episode['proprio_history']
+        if 'subgoal_trace' in episode:
+            seq_dict['subgoal_trace'] = episode['subgoal_trace']
+
+        return seq_dict
+
     def merge_episodes(self, episode1: Dict[str, np.ndarray], episode2: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
         merged_episode = {}
         all_keys = set(episode1.keys()).union(set(episode2.keys()))

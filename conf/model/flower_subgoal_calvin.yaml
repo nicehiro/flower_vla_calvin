@@ -1,5 +1,6 @@
-# FLOWERVLA Configuration
-_target_: flower.models.flower.FLOWERVLA
+# FlowerSubgoalVLA Configuration for CALVIN
+# Extension of FLOWERVLA with proprio history injection and subgoal prediction head
+_target_: flower.models.flower_subgoal.FlowerSubgoalVLA
 _recursive_: false
 
 # VLM Configuration
@@ -7,7 +8,7 @@ vlm_path: microsoft/Florence-2-large
 freeze_florence: False
 freeze_vision_tower: False
 vlm_prompt_style: default
-token_dropout: 0.1  # Added token dropout parameter
+token_dropout: 0.1
 
 # Model Structure
 multistep: ${multistep}
@@ -16,12 +17,11 @@ lowdim_obs_dim: 7
 action_dim: 7
 act_window_size: 10
 
-# pretraining stuff
+# Pretraining
 load_pretrained: False
-pretrained_model_path: /home/hk-project-sustainebot/ft4740/code/flower_vla_policy/logs/runs/2025-02-05/10-17-02/360000_model_weights.pt
-# /home/hk-project-sustainebot/ft4740/code/flower_vla/logs/runs/2025-02-19/11-15-41/200000_model_weights.pt
-# /home/hk-project-sustainebot/ft4740/code/flower_vla_policy/logs/runs/2025-02-05/10-17-02/360000_model_weights.pt joint + delta pret
-# Model flags
+pretrained_model_path: null
+
+# Model flags (inherited from FLOWERVLA)
 use_second_view: True
 second_view_key: image_wrist
 action_type_adaln: True
@@ -32,7 +32,25 @@ use_readout_token: false
 use_proprio: false
 return_act_chunk: false
 
-# DiT Configuration
+# Proprio History Configuration
+use_proprio_history: ${use_proprio_history}
+proprio_history_len: ${proprio_history_len}
+proprio_dims: ${proprio_dims}
+
+# Subgoal Configuration
+use_subgoal_head: ${use_subgoal_head}
+subgoal_horizon: ${subgoal_horizon}
+subgoal_interval: ${subgoal_interval}
+subgoal_dit_dim: 1024
+subgoal_n_layers: 12
+subgoal_n_heads: 16
+
+# Training Stage Configuration
+training_stage: ${training_stage}
+subgoal_loss_weight: ${subgoal_loss_weight}
+action_loss_weight: ${action_loss_weight}
+
+# DiT Configuration (Action Head)
 sampling_type: uniform
 dit_dim: 1024
 n_heads: 16
