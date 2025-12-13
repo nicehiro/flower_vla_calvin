@@ -5,20 +5,20 @@ defaults:
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
 
-root_data_dir: /hkfs/work/workspace/scratch/ft4740-play3/task_ABCD_D
+root_data_dir: /data/fywang/Calvin/task_ABC_D/
 lang_folder: lang_clip_resnet50
 
-log_dir: ./logs
+log_dir: /outputs/logs/
 slurm: false
 seed: 242
 device: 'cuda'
-batch_size: 8 
-devices: 4
+batch_size: 32
+devices: 1
 act_dim: 7
 proprio_dims: 7
 obs_dim: 512
 goal_dim: 512
-obs_seq_len: 1
+obs_seq_len: 5  # Changed from 1 to support proprio history
 act_seq_len: 10
 multistep: 10 #${act_seq_len}
 p_last_state: 0
@@ -35,18 +35,18 @@ trainer:
   max_epochs: ${max_epochs}
   sync_batchnorm: True
   accelerator: gpu
-  strategy: "ddp" 
+  strategy: "ddp"
   limit_train_batches: 1000
   limit_val_batches: 4
 
 logger:
   _target_: pytorch_lightning.loggers.WandbLogger
-  save_dir: .
+  save_dir: /output/logs/
   name: logger
   group: mode
   log_model: false
-  project: ${benchmark_name}
-  entity: bennoq
+  project: flower
+  entity: fywang96
   id: ???
 
 hydra:
