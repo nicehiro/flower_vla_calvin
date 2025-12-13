@@ -18,9 +18,9 @@ observation_space:
   language: ['language']
 
 proprioception_dims:
-  n_state_obs: 8
-  keep_indices: [[0, 7], [14,15]]
-  robot_orientation_idx: [3, 6]
+  n_state_obs: 15
+  keep_indices: [[0, 15]]  # Full robot_obs: TCP(7) + joints(7) + gripper(1) = 15D
+  robot_orientation_idx: [3, 7]
   normalize: True
   normalize_robot_orientation: True
 

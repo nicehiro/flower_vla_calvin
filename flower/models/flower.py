@@ -35,6 +35,45 @@ from flower.models.utils import ActionIndex, generate_policy_prompt
 
 logger = logging.getLogger(__name__)
 
+class ProprioHistoryEncoder(nn.Module):
+    """Encodes proprioceptive state history into a single embedding.
+
+    Takes a sequence of robot states and produces a fixed-size embedding
+    that captures temporal dynamics (velocity, acceleration patterns).
+
+    # TODO: Future improvement - use cross-attention integration instead of
+    # global conditioning. Let action tokens attend to state history tokens
+    # to learn which historical states are relevant for each predicted action.
+    """
+
+    def __init__(self, history_len: int, state_dim: int, output_dim: int):
+        """
+        Args:
+            history_len: Number of history frames (e.g., 5)
+            state_dim: Dimension of state per frame (e.g., 16 for CALVIN)
+            output_dim: Output embedding dimension (e.g., 1024 = dit_dim)
+        """
+        super().__init__()
+        input_dim = history_len * state_dim
+        hidden_dim = min(512, output_dim // 2)
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, state_history: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            state_history: [B, history_len, state_dim] tensor of robot states
+        Returns:
+            embedding: [B, output_dim] tensor
+        """
+        B = state_history.shape[0]
+        flattened = state_history.view(B, -1)  # [B, history_len * state_dim]
+        return self.encoder(flattened)
+
 class FLOWERVLA(pl.LightningModule):
     def __init__(
         self,
@@ -61,6 +100,9 @@ class FLOWERVLA(pl.LightningModule):
         use_adaln_cond: bool = False,
         use_readout_token: bool = False,
         use_proprio: bool = False,
+        use_proprio_history: bool = False,
+        proprio_history_len: int = 5,
+        proprio_state_dim: int = 16,
         return_act_chunk: bool = False,
         
         # DiT Configuration
@@ -104,6 +146,9 @@ class FLOWERVLA(pl.LightningModule):
             action_type_adaln=action_type_adaln,
             sampling_type=sampling_type,
             use_proprio=use_proprio,
+            use_proprio_history=use_proprio_history,
+            proprio_history_len=proprio_history_len,
+            proprio_state_dim=proprio_state_dim,
             return_act_chunk=return_act_chunk,
             second_view_key=second_view_key,
         )
@@ -341,6 +386,15 @@ class FLOWERVLA(pl.LightningModule):
             
         self.adaln = nn.ModuleDict() if self.action_type_adaln else None
 
+        # Proprio history encoder (new feature)
+        if self.use_proprio_history:
+            self.proprio_history_encoder = ProprioHistoryEncoder(
+                history_len=self.proprio_history_len,
+                state_dim=self.proprio_state_dim,
+                output_dim=dit_dim,
+            )
+            logger.info(f"[ProprioHistory] Encoder created: history_len={self.proprio_history_len}, state_dim={self.proprio_state_dim}, output_dim={dit_dim}")
+
         # Core components
         self.cond_linear = nn.Linear(hidden_dim, dit_dim, bias=False)
         self.t_embedder = TimestepEmbedder(dit_dim)
@@ -577,12 +631,21 @@ class FLOWERVLA(pl.LightningModule):
         frequency_embeds = cond_dict['frequency_embeds'].squeeze(1).to(default_dtype)
         action_type = cond_dict['action_type'].to(self.device)
         
-        # Handle proprioception
-        if self.use_proprio and cond_dict['proprio'] is not None:
+        # Handle proprioception - prioritize history over single-frame
+        if self.use_proprio_history and cond_dict.get('proprio_history') is not None:
+            # New: use history-based encoding
+            proprio_history = cond_dict['proprio_history'].to(default_dtype)  # [B, history_len, state_dim]
+            proprio_embeds = self.proprio_history_encoder(proprio_history)  # [B, dit_dim]
+            # Log shapes on first call for verification
+            if not hasattr(self, '_proprio_history_logged'):
+                logger.info(f"[ProprioHistory] Input shape: {proprio_history.shape}, Output shape: {proprio_embeds.shape}")
+                self._proprio_history_logged = True
+        elif self.use_proprio and cond_dict.get('proprio') is not None:
+            # Legacy: single-frame encoding
             proprio = cond_dict['proprio'].to(default_dtype)
             proprio_embeds = self.encode_proprio(proprio, action_type, frequency_embeds.shape)
         else:
-            proprio_embeds = torch.zeros_like(frequency_embeds)
+            proprio_embeds = torch.zeros_like(frequency_embeds.squeeze(1))
         
         # Encode actions
         z, valid_dims = self.encode_actions(z, action_type)
@@ -748,8 +811,13 @@ class FLOWERVLA(pl.LightningModule):
         
         # Get proprioception if enabled
         proprio = None
-        if self.use_proprio and 'proprio' in batch[self.obs_modalities]:
-            proprio = batch[self.obs_modalities]['proprio'].to(device).to(default_type)
+        proprio_history = None
+        if self.use_proprio_history and 'robot_obs' in batch:
+            # New: extract history from batch
+            proprio_history = batch['robot_obs'].to(device).to(default_type)  # [B, history_len, state_dim]
+        elif self.use_proprio and 'robot_obs' in batch:
+            # Legacy: single frame
+            proprio = batch['robot_obs'][:, -1, :].to(device).to(default_type)  # [B, state_dim]
 
         return {
             'features': features,
@@ -757,6 +825,7 @@ class FLOWERVLA(pl.LightningModule):
             'action_space_embeds': None,
             'action_type': torch.ones_like(action_type_tensor), # actiont ype is always 1
             'proprio': proprio,
+            'proprio_history': proprio_history,
             'attention_mask': attention_mask,
         }
 

@@ -17,7 +17,7 @@ action_dim: 7
 act_window_size: 10
 
 # pretraining stuff
-load_pretrained: True
+load_pretrained: False
 pretrained_model_path: /home/hk-project-sustainebot/ft4740/code/flower_vla_policy/logs/runs/2025-02-05/10-17-02/360000_model_weights.pt
 # /home/hk-project-sustainebot/ft4740/code/flower_vla/logs/runs/2025-02-19/11-15-41/200000_model_weights.pt
 # /home/hk-project-sustainebot/ft4740/code/flower_vla_policy/logs/runs/2025-02-05/10-17-02/360000_model_weights.pt joint + delta pret
@@ -30,6 +30,10 @@ use_cross_attn: True
 use_adaln_cond: false
 use_readout_token: false
 use_proprio: false
+# Proprioception History (new feature)
+use_proprio_history: false     # Enable history-based proprio encoding
+proprio_history_len: 5         # Number of history frames
+proprio_state_dim: 15          # State dimension per frame (CALVIN robot_obs is 15D)
 return_act_chunk: false
 
 # DiT Configuration
