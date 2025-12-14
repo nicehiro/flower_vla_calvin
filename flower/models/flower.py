@@ -74,6 +74,39 @@ class ProprioHistoryEncoder(nn.Module):
         flattened = state_history.view(B, -1)  # [B, history_len * state_dim]
         return self.encoder(flattened)
 
+
+class ProprioVLMTokenizer(nn.Module):
+    """Projects proprioception state to VLM embedding dimension for injection into VLM encoder."""
+
+    def __init__(self, state_dim: int, vlm_dim: int, use_history: bool = False, history_len: int = 5):
+        """
+        Args:
+            state_dim: Dimension of state per frame (e.g., 15 for CALVIN)
+            vlm_dim: VLM embedding dimension (1024 for Florence-2-large)
+            use_history: If True, tokenize full history; if False, only current state
+            history_len: Number of history frames when use_history=True
+        """
+        super().__init__()
+        self.use_history = use_history
+        self.history_len = history_len
+        self.proj = nn.Linear(state_dim, vlm_dim)
+        logger.info(f"[ProprioVLM] Tokenizer created: state_dim={state_dim}, vlm_dim={vlm_dim}, use_history={use_history}")
+
+    def forward(self, proprio: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            proprio: [B, state_dim] if use_history=False, [B, history_len, state_dim] if use_history=True
+        Returns:
+            tokens: [B, 1, vlm_dim] or [B, history_len, vlm_dim]
+        """
+        if self.use_history:
+            # proprio is [B, history_len, state_dim]
+            return self.proj(proprio)  # [B, history_len, vlm_dim]
+        else:
+            # proprio is [B, state_dim]
+            return self.proj(proprio).unsqueeze(1)  # [B, 1, vlm_dim]
+
+
 class FLOWERVLA(pl.LightningModule):
     def __init__(
         self,
@@ -104,7 +137,12 @@ class FLOWERVLA(pl.LightningModule):
         proprio_history_len: int = 5,
         proprio_state_dim: int = 16,
         return_act_chunk: bool = False,
-        
+
+        # Proprio-in-VLM Configuration
+        proprio_in_vlm: bool = False,
+        proprio_vlm_position: str = "append",
+        proprio_vlm_use_history: bool = False,
+
         # DiT Configuration
         sampling_type: str = 'ln',
         dit_dim: int = 512,
@@ -151,6 +189,9 @@ class FLOWERVLA(pl.LightningModule):
             proprio_state_dim=proprio_state_dim,
             return_act_chunk=return_act_chunk,
             second_view_key=second_view_key,
+            proprio_in_vlm=proprio_in_vlm,
+            proprio_vlm_position=proprio_vlm_position,
+            proprio_vlm_use_history=proprio_vlm_use_history,
         )
         self.obs_modalities = []
         # Initialize model dimensions
@@ -313,7 +354,10 @@ class FLOWERVLA(pl.LightningModule):
             
         if self.sampling_type not in ['ln', 'pi_zero', 'loglogistic', 'uniform', 'stratified']:
             raise ValueError(f"Invalid sampling type: {self.sampling_type}")
-        
+
+        if self.proprio_vlm_position not in ["prepend", "between", "append"]:
+            raise ValueError(f"Invalid proprio_vlm_position: {self.proprio_vlm_position}. Must be prepend/between/append")
+
         self.format_instruction = functools.partial(
                              generate_policy_prompt,
                              robot_name="Franka Panda",
@@ -367,6 +411,19 @@ class FLOWERVLA(pl.LightningModule):
         
         # Setup token dropout
         self.vlm_token_dropout = nn.Dropout(self.token_dropout)
+
+        # Initialize proprio-in-VLM tokenizer if enabled
+        if self.proprio_in_vlm:
+            vlm_dim = self.vlm.config.text_config.d_model  # 1024 for Florence-2-large
+            self.proprio_vlm_tokenizer = ProprioVLMTokenizer(
+                state_dim=self.proprio_state_dim,
+                vlm_dim=vlm_dim,
+                use_history=self.proprio_vlm_use_history,
+                history_len=self.proprio_history_len,
+            )
+            logger.info(f"[ProprioVLM] Enabled with position='{self.proprio_vlm_position}', use_history={self.proprio_vlm_use_history}")
+        else:
+            logger.info("[ProprioVLM] Disabled (proprio_in_vlm=false)")
 
     def _setup_dit_components(self, **kwargs):
         """Setup DiT model components"""
@@ -776,7 +833,25 @@ class FLOWERVLA(pl.LightningModule):
             ).to(default_type)
             image2_features = image2_features.view(B, T * image2_features.shape[1], -1)
             image_features = torch.cat([image_features, image2_features], dim=1)
-        
+
+        # Get proprio tokens for VLM injection if enabled
+        proprio_vlm_tokens = None
+        if self.proprio_in_vlm and 'robot_obs' in batch:
+            robot_obs = batch['robot_obs'].to(device).to(default_type)
+            if self.proprio_vlm_use_history:
+                # Use full history: [B, history_len, state_dim]
+                proprio_vlm_tokens = self.proprio_vlm_tokenizer(robot_obs)
+                if not hasattr(self, '_proprio_vlm_input_logged'):
+                    logger.info(f"[ProprioVLM] Using history mode: robot_obs shape: {robot_obs.shape}")
+                    self._proprio_vlm_input_logged = True
+            else:
+                # Use only current state: [B, state_dim]
+                current_state = robot_obs[:, -1, :]
+                proprio_vlm_tokens = self.proprio_vlm_tokenizer(current_state)
+                if not hasattr(self, '_proprio_vlm_input_logged'):
+                    logger.info(f"[ProprioVLM] Using current state mode: current_state shape: {current_state.shape}")
+                    self._proprio_vlm_input_logged = True
+
         # Get text embeddings
         # Get text embeddings once to reuse
         constructed_prompts = self.construct_prompts(batch)
@@ -784,14 +859,47 @@ class FLOWERVLA(pl.LightningModule):
         
         # Add task prompt and aggregation tokens
         task_prompt = self.prompt_embeds.expand(B, -1, -1).to(image_features.device)
-        
-        # Merge sequence
-        merged_embeds = torch.cat([
-            image_features,
-            task_prompt,
-            text_embeds.to(image_features.device)
-        ], dim=1)
-        
+
+        # Merge sequence with optional proprio tokens
+        if proprio_vlm_tokens is not None:
+            if self.proprio_vlm_position == "prepend":
+                # proprio before vision
+                merged_embeds = torch.cat([
+                    proprio_vlm_tokens,
+                    image_features,
+                    task_prompt,
+                    text_embeds.to(image_features.device)
+                ], dim=1)
+            elif self.proprio_vlm_position == "between":
+                # proprio between vision and text
+                merged_embeds = torch.cat([
+                    image_features,
+                    proprio_vlm_tokens,
+                    task_prompt,
+                    text_embeds.to(image_features.device)
+                ], dim=1)
+            else:  # "append" (default)
+                # proprio after text
+                merged_embeds = torch.cat([
+                    image_features,
+                    task_prompt,
+                    text_embeds.to(image_features.device),
+                    proprio_vlm_tokens,
+                ], dim=1)
+            # Log shape on first call
+            if not hasattr(self, '_proprio_vlm_logged'):
+                logger.info(f"[ProprioVLM] Position: '{self.proprio_vlm_position}'")
+                logger.info(f"[ProprioVLM] Component shapes - image: {image_features.shape[1]}, task: {task_prompt.shape[1]}, text: {text_embeds.shape[1]}, proprio: {proprio_vlm_tokens.shape[1]}")
+                logger.info(f"[ProprioVLM] Proprio tokens shape: {proprio_vlm_tokens.shape}, merged shape: {merged_embeds.shape}")
+                self._proprio_vlm_logged = True
+        else:
+            # Original behavior without proprio
+            merged_embeds = torch.cat([
+                image_features,
+                task_prompt,
+                text_embeds.to(image_features.device)
+            ], dim=1)
+
         # Create attention mask
         attention_mask = torch.ones(merged_embeds.shape[:2], device=merged_embeds.device)
         
