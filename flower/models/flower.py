@@ -894,6 +894,23 @@ class FLOWERVLA(pl.LightningModule):
             # Wrapper provides [B, state_dim], we need [B, history_len, state_dim]
             if robot_obs.dim() == 2:
                 robot_obs = robot_obs.unsqueeze(1)  # [B, 1, state_dim]
+
+            # During inference (eval mode with single-frame input): maintain rolling history buffer
+            # During training: dataloader already provides full history, skip buffer logic
+            if not self.training and robot_obs.shape[1] == 1:
+                if self.proprio_history_buffer is None:
+                    # First step: initialize buffer by repeating current obs
+                    self.proprio_history_buffer = robot_obs.repeat(1, self.proprio_history_len, 1)
+                    logger.info(f"Initialized proprio_history_buffer: shape={self.proprio_history_buffer.shape}")
+                else:
+                    # Shift buffer: remove oldest, append newest (FIFO)
+                    self.proprio_history_buffer = torch.cat([
+                        self.proprio_history_buffer[:, 1:, :],  # Keep last (history_len-1) frames
+                        robot_obs  # Add current frame
+                    ], dim=1)
+                robot_obs = self.proprio_history_buffer
+            logger.info(f"Final robot_obs for batch: shape={robot_obs.shape}")
+
             batch["robot_obs"] = robot_obs
 
         features = self.encode_observations(batch)
@@ -942,6 +959,7 @@ class FLOWERVLA(pl.LightningModule):
         """Reset model state for new rollout."""
         self.rollout_step_counter = 0
         self.pred_action_seq = None
+        self.proprio_history_buffer = None  # Reset history buffer for new episode
         self.eval()
 
     def on_train_start(self):
