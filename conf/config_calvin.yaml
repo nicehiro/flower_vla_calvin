@@ -18,7 +18,7 @@ act_dim: 7
 proprio_dims: 7
 obs_dim: 512
 goal_dim: 512
-obs_seq_len: 5  # Changed from 1 to support proprio history
+obs_seq_len: 5
 act_seq_len: 10
 multistep: 10 #${act_seq_len}
 p_last_state: 0
