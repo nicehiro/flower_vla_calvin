@@ -89,7 +89,14 @@ class ProprioVLMTokenizer(nn.Module):
         super().__init__()
         self.use_history = use_history
         self.history_len = history_len
-        self.proj = nn.Linear(state_dim, vlm_dim)
+
+        # Use timm.Mlp with larger hidden dim (matches action encoders)
+        self.encoder = Mlp(
+            in_features=state_dim,
+            hidden_features=vlm_dim,
+            out_features=vlm_dim,
+            bias=True,
+        )
         logger.info(f"[ProprioVLM] Tokenizer created: state_dim={state_dim}, vlm_dim={vlm_dim}, use_history={use_history}")
 
     def forward(self, proprio: torch.Tensor) -> torch.Tensor:
@@ -101,10 +108,10 @@ class ProprioVLMTokenizer(nn.Module):
         """
         if self.use_history:
             # proprio is [B, history_len, state_dim]
-            return self.proj(proprio)  # [B, history_len, vlm_dim]
+            return self.encoder(proprio)  # [B, history_len, vlm_dim]
         else:
             # proprio is [B, state_dim]
-            return self.proj(proprio).unsqueeze(1)  # [B, 1, vlm_dim]
+            return self.encoder(proprio).unsqueeze(1)  # [B, 1, vlm_dim]
 
 
 class FLOWERVLA(pl.LightningModule):
@@ -1066,6 +1073,7 @@ class FLOWERVLA(pl.LightningModule):
         """Reset model state for new rollout."""
         self.rollout_step_counter = 0
         self.pred_action_seq = None
+        self.proprio_history_buffer = None
         self.eval()
 
     def on_train_start(self):
