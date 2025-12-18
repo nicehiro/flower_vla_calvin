@@ -11,14 +11,14 @@ lang_folder: lang_clip_resnet50
 log_dir: /outputs/logs/
 slurm: false
 seed: 242
-device: 'cuda'
+device: "cuda"
 batch_size: 32
 devices: 1
 act_dim: 7
 proprio_dims: 7
 obs_dim: 512
 goal_dim: 512
-obs_seq_len: 5  # Changed from 1 to support proprio history
+obs_seq_len: 5
 act_seq_len: 10
 multistep: 10 #${act_seq_len}
 p_last_state: 0
@@ -41,7 +41,7 @@ trainer:
 
 logger:
   _target_: pytorch_lightning.loggers.WandbLogger
-  save_dir: /output/logs/
+  save_dir: /outputs/logs/
   name: logger
   group: mode
   log_model: false
