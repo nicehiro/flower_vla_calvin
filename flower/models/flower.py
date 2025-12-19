@@ -717,12 +717,33 @@ class FLOWERVLA(pl.LightningModule):
             proprio_embeds = self.proprio_history_encoder(
                 proprio_history
             )  # [B, dit_dim]
-            # Log shapes on first call for verification
-            if not hasattr(self, "_proprio_history_logged"):
+
+            # Detailed logging for debugging train/test consistency
+            if not hasattr(self, "_proprio_log_count"):
+                self._proprio_log_count = 0
+            self._proprio_log_count += 1
+
+            # Log first few calls and periodically after that
+            should_log = self._proprio_log_count <= 20 or self._proprio_log_count % 1000 == 0
+            if should_log:
+                mode = "TRAIN" if self.training else "EVAL"
+                # Compute statistics to check for anomalies
+                hist_mean = proprio_history.mean().item()
+                hist_std = proprio_history.std().item()
+                hist_min = proprio_history.min().item()
+                hist_max = proprio_history.max().item()
+                # Check temporal variance (are frames diverse or identical?)
+                temporal_var = proprio_history.var(dim=1).mean().item()
+                # Check how many zeros (for detecting zero-initialized buffer)
+                zero_ratio = (proprio_history == 0).float().mean().item()
+
                 logger.info(
-                    f"[ProprioHistory] Input shape: {proprio_history.shape}, Output shape: {proprio_embeds.shape}"
+                    f"[ProprioHistory][{mode}][call={self._proprio_log_count}] "
+                    f"shape={list(proprio_history.shape)}, "
+                    f"mean={hist_mean:.4f}, std={hist_std:.4f}, "
+                    f"min={hist_min:.4f}, max={hist_max:.4f}, "
+                    f"temporal_var={temporal_var:.6f}, zero_ratio={zero_ratio:.2%}"
                 )
-                self._proprio_history_logged = True
         elif self.use_proprio and cond_dict.get("proprio") is not None:
             # Legacy: single-frame encoding
             proprio = cond_dict["proprio"].to(default_dtype)
@@ -997,24 +1018,20 @@ class FLOWERVLA(pl.LightningModule):
         if self.use_proprio_history and "robot_obs" in obs:
             robot_obs = obs["robot_obs"]
             # Wrapper provides [B, state_dim], we need [B, history_len, state_dim]
-            if robot_obs.dim() == 2:
+            if len(robot_obs.shape) == 2:
                 robot_obs = robot_obs.unsqueeze(1)  # [B, 1, state_dim]
 
-            # During inference (eval mode with single-frame input): maintain rolling history buffer
-            # During training: dataloader already provides full history, skip buffer logic
-            if not self.training and robot_obs.shape[1] == 1:
-                if self.proprio_history_buffer is None:
-                    # First step: initialize buffer by repeating current obs
-                    self.proprio_history_buffer = robot_obs.repeat(1, self.proprio_history_len, 1)
-                    logger.info(f"Initialized proprio_history_buffer: shape={self.proprio_history_buffer.shape}")
-                else:
-                    # Shift buffer: remove oldest, append newest (FIFO)
-                    self.proprio_history_buffer = torch.cat([
-                        self.proprio_history_buffer[:, 1:, :],  # Keep last (history_len-1) frames
-                        robot_obs  # Add current frame
-                    ], dim=1)
-                robot_obs = self.proprio_history_buffer
-            logger.info(f"Final robot_obs for batch: shape={robot_obs.shape}")
+            if self.proprio_history_buffer is None:
+                self.proprio_history_buffer = torch.zeros(
+                    robot_obs.shape[0], self.proprio_history_len, robot_obs.shape[-1],
+                    device=robot_obs.device, dtype=robot_obs.dtype
+                )
+            self.proprio_history_buffer = torch.cat([
+                self.proprio_history_buffer[:, 1:, :],
+                robot_obs
+            ], dim=1)
+
+            robot_obs = self.proprio_history_buffer
 
             batch["robot_obs"] = robot_obs
 
@@ -1061,11 +1078,26 @@ class FLOWERVLA(pl.LightningModule):
         return current_action
 
     def reset(self):
-        """Reset model state for new rollout."""
+        """Reset model state for new subtask.
+
+        Keeps proprio_history_buffer intact since robot state is continuous
+        across subtasks within the same evaluation sequence.
+        """
         self.rollout_step_counter = 0
         self.pred_action_seq = None
-        self.proprio_history_buffer = None
+        # Don't reset proprio_history_buffer - keep rolling history across subtasks
         self.eval()
+
+    def reset_sequence(self):
+        """Full reset for new evaluation sequence.
+
+        Call this at the start of a new multi-subtask sequence to clear
+        the proprio history buffer completely.
+        """
+        self.reset()
+        self.proprio_history_buffer = None
+        self._buffer_log_count = 0  # Reset log counter for new sequence
+        logger.info("[ProprioBuffer] reset_sequence() called - buffer cleared for new evaluation sequence")
 
     def on_train_start(self):
         """Convert model to appropriate dtype on training start."""

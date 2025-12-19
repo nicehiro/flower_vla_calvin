@@ -53,7 +53,7 @@ def sequences_for_rank(num_sequences):
     print(rank)
     sequences = get_sequences(num_sequences, num_workers=num_workers)
     # print("Sequences:", sequences)
-    
+
     print(f"Type of sequences: {type(sequences)}")
     print(f"Length of sequences: {len(sequences)}")
     print(f"First few elements of sequences: {sequences[:5]}")
@@ -146,7 +146,7 @@ class RolloutLongHorizon(Callback):
             try:
                 # Get validation dataloader safely
                 val_dataloaders = trainer.val_dataloaders
-                
+
                 # Handle the dict structure
                 if isinstance(val_dataloaders, dict):
                     # Try to get 'lang' dataloader first, fallback to first available dataloader
@@ -158,7 +158,7 @@ class RolloutLongHorizon(Callback):
 
                 # Get the dataset directly - it's an ExtendedDiskDataset
                 dataset = dataloader.dataset
-                
+
                 # Initialize environment
                 from flower.rollout.rollout import Rollout
                 for callback in trainer.callbacks:
@@ -172,8 +172,8 @@ class RolloutLongHorizon(Callback):
                 if self.num_videos > 0:
                     if dist.is_available() and dist.is_initialized():
                         self.num_videos = divide_across_ranks(
-                            self.num_videos, 
-                            dist.get_world_size(), 
+                            self.num_videos,
+                            dist.get_world_size(),
                             dist.get_rank()
                         )
                     self.rollout_video = RolloutVideo(
@@ -185,8 +185,8 @@ class RolloutLongHorizon(Callback):
 
                 # Initialize language embeddings with the dataset
                 self.lang_embeddings = LangEmbeddings(
-                    dataset.abs_datasets_dir, 
-                    dataset.lang_folder, 
+                    dataset.abs_datasets_dir,
+                    dataset.lang_folder,
                     device=pl_module.device
                 )
 
@@ -207,8 +207,8 @@ class RolloutLongHorizon(Callback):
 
         # Check if we should run evaluation this epoch
         should_evaluate = (
-            pl_module.current_epoch == self.skip_epochs or 
-            ((pl_module.current_epoch - self.skip_epochs) >= 0 and 
+            pl_module.current_epoch == self.skip_epochs or
+            ((pl_module.current_epoch - self.skip_epochs) >= 0 and
              (pl_module.current_epoch - self.skip_epochs) % self.rollout_freq == 0)
         )
 
@@ -232,15 +232,15 @@ class RolloutLongHorizon(Callback):
         """Log zero metrics for skipped evaluations."""
         for i in range(1, 6):
             pl_module.log(
-                f"eval_lh/sr_chain_{i}", 
-                torch.tensor(0.0), 
-                on_step=False, 
+                f"eval_lh/sr_chain_{i}",
+                torch.tensor(0.0),
+                on_step=False,
                 sync_dist=True
             )
         pl_module.log(
-            "eval_lh/avg_seq_len", 
-            torch.tensor(0.0), 
-            on_step=False, 
+            "eval_lh/avg_seq_len",
+            torch.tensor(0.0),
+            on_step=False,
             sync_dist=True
         )
 
@@ -262,6 +262,8 @@ class RolloutLongHorizon(Callback):
     def evaluate_sequence(self, model, initial_state, eval_sequence, record, i):
         robot_obs, scene_obs = get_env_state_for_initial_condition(initial_state)
         self.env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
+        # Full reset at start of new sequence (clears proprio history buffer)
+        model.reset_sequence()
         if record:
             caption = " | ".join(eval_sequence)
             self.rollout_video.new_video(tag=get_video_tag(i), caption=caption)
