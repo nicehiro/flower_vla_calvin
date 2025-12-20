@@ -50,17 +50,18 @@ class ProprioHistoryEncoder(nn.Module):
         """
         Args:
             history_len: Number of history frames (e.g., 5)
-            state_dim: Dimension of state per frame (e.g., 16 for CALVIN)
+            state_dim: Dimension of state per frame (e.g., 15 for CALVIN)
             output_dim: Output embedding dimension (e.g., 1024 = dit_dim)
         """
         super().__init__()
         input_dim = history_len * state_dim
-        hidden_dim = min(512, output_dim // 2)
 
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, output_dim),
+        # Use timm.Mlp with larger hidden dim (matches action encoders)
+        self.encoder = Mlp(
+            in_features=input_dim,
+            hidden_features=output_dim,  # 1024 instead of 512
+            out_features=output_dim,
+            bias=True,
         )
 
     def forward(self, state_history: torch.Tensor) -> torch.Tensor:
@@ -91,11 +92,15 @@ class ProprioVLMTokenizer(nn.Module):
         self.history_len = history_len
 
         # Use timm.Mlp with larger hidden dim (matches action encoders)
-        self.encoder = Mlp(
-            in_features=state_dim,
-            hidden_features=vlm_dim,
-            out_features=vlm_dim,
-            bias=True,
+        # Added LayerNorm for stability
+        self.encoder = nn.Sequential(
+            Mlp(
+                in_features=state_dim,
+                hidden_features=vlm_dim,
+                out_features=vlm_dim,
+                bias=True,
+            ),
+            nn.LayerNorm(vlm_dim)
         )
         logger.info(f"[ProprioVLM] Tokenizer created: state_dim={state_dim}, vlm_dim={vlm_dim}, use_history={use_history}")
 
@@ -149,6 +154,7 @@ class FLOWERVLA(pl.LightningModule):
         proprio_in_vlm: bool = False,
         proprio_vlm_position: str = "append",
         proprio_vlm_use_history: bool = False,
+        proprio_dropout: float = 0.0,
 
         # DiT Configuration
         sampling_type: str = 'ln',
@@ -199,6 +205,7 @@ class FLOWERVLA(pl.LightningModule):
             proprio_in_vlm=proprio_in_vlm,
             proprio_vlm_position=proprio_vlm_position,
             proprio_vlm_use_history=proprio_vlm_use_history,
+            proprio_dropout=proprio_dropout,
         )
         self.obs_modalities = []
         # Initialize model dimensions
@@ -381,6 +388,7 @@ class FLOWERVLA(pl.LightningModule):
         self.use_nope = self.use_nope and not self.use_rope
         self.vlm_prompt_style = self.vlm_prompt_style
         self.return_act_chunk = False
+        self.proprio_dropout = self.proprio_dropout
 
     def _init_dimensions(self, **kwargs):
         """Initialize model dimensions"""
@@ -861,6 +869,12 @@ class FLOWERVLA(pl.LightningModule):
                     logger.info(f"[ProprioVLM] Using current state mode: current_state shape: {current_state.shape}")
                     self._proprio_vlm_input_logged = True
 
+            # Apply dropout to proprioceptive tokens if training
+            if self.training and self.proprio_dropout > 0.0:
+                 # Create a binary mask with probability (1 - p) of keeping the token
+                mask = torch.bernoulli(torch.ones(proprio_vlm_tokens.shape[0], 1, 1, device=device) * (1 - self.proprio_dropout))
+                proprio_vlm_tokens = proprio_vlm_tokens * mask
+
         # Get text embeddings
         # Get text embeddings once to reuse
         constructed_prompts = self.construct_prompts(batch)
@@ -1015,14 +1029,16 @@ class FLOWERVLA(pl.LightningModule):
             # During training: dataloader already provides full history, skip buffer logic
             if not self.training and robot_obs.shape[1] == 1:
                 if self.proprio_history_buffer is None:
-                    # First step: initialize buffer by repeating current obs
-                    self.proprio_history_buffer = robot_obs.repeat(1, self.proprio_history_len, 1)
-                else:
-                    # Shift buffer: remove oldest, append newest (FIFO)
-                    self.proprio_history_buffer = torch.cat([
-                        self.proprio_history_buffer[:, 1:, :],  # Keep last (history_len-1) frames
-                        robot_obs  # Add current frame
-                    ], dim=1)
+                    # First step: initialize buffer with zeros (more stable than repeating first obs)
+                    self.proprio_history_buffer = torch.zeros(
+                        robot_obs.shape[0], self.proprio_history_len, robot_obs.shape[-1],
+                        device=robot_obs.device, dtype=robot_obs.dtype
+                    )
+                # Shift buffer: remove oldest, append newest (FIFO)
+                self.proprio_history_buffer = torch.cat([
+                    self.proprio_history_buffer[:, 1:, :],  # Keep last (history_len-1) frames
+                    robot_obs  # Add current frame
+                ], dim=1)
                 robot_obs = self.proprio_history_buffer
 
             batch["robot_obs"] = robot_obs
@@ -1070,11 +1086,25 @@ class FLOWERVLA(pl.LightningModule):
         return current_action
 
     def reset(self):
-        """Reset model state for new rollout."""
+        """Reset model state for new subtask.
+
+        Keeps proprio_history_buffer intact since robot state is continuous
+        across subtasks within the same evaluation sequence.
+        """
         self.rollout_step_counter = 0
         self.pred_action_seq = None
-        self.proprio_history_buffer = None
+        # Don't reset proprio_history_buffer - keep rolling history across subtasks
         self.eval()
+
+    def reset_sequence(self):
+        """Full reset for new evaluation sequence.
+
+        Call this at the start of a new multi-subtask sequence to clear
+        the proprio history buffer completely.
+        """
+        self.reset()
+        self.proprio_history_buffer = None
+        logger.info("[ProprioBuffer] reset_sequence() called - buffer cleared")
 
     def on_train_start(self):
         """Convert model to appropriate dtype on training start."""

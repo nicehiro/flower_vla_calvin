@@ -40,6 +40,7 @@ return_act_chunk: false
 proprio_in_vlm: true            # Enable proprio injection into VLM
 proprio_vlm_position: "append"   # prepend | between | append (relative to text)
 proprio_vlm_use_history: true   # Use full history (5 frames) or just current state (1 frame)
+proprio_dropout: 0.5            # Probability of dropping proprioceptive tokens during training
 
 # DiT Configuration
 sampling_type: uniform

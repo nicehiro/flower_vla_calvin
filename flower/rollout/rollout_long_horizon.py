@@ -262,6 +262,8 @@ class RolloutLongHorizon(Callback):
     def evaluate_sequence(self, model, initial_state, eval_sequence, record, i):
         robot_obs, scene_obs = get_env_state_for_initial_condition(initial_state)
         self.env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
+        # Clear proprio history buffer for new evaluation sequence
+        model.reset_sequence()
         if record:
             caption = " | ".join(eval_sequence)
             self.rollout_video.new_video(tag=get_video_tag(i), caption=caption)
