@@ -35,47 +35,6 @@ from flower.models.utils import ActionIndex, generate_policy_prompt
 
 logger = logging.getLogger(__name__)
 
-class ProprioHistoryEncoder(nn.Module):
-    """Encodes proprioceptive state history into a single embedding.
-
-    Takes a sequence of robot states and produces a fixed-size embedding
-    that captures temporal dynamics (velocity, acceleration patterns).
-
-    # TODO: Future improvement - use cross-attention integration instead of
-    # global conditioning. Let action tokens attend to state history tokens
-    # to learn which historical states are relevant for each predicted action.
-    """
-
-    def __init__(self, history_len: int, state_dim: int, output_dim: int):
-        """
-        Args:
-            history_len: Number of history frames (e.g., 5)
-            state_dim: Dimension of state per frame (e.g., 15 for CALVIN)
-            output_dim: Output embedding dimension (e.g., 1024 = dit_dim)
-        """
-        super().__init__()
-        input_dim = history_len * state_dim
-
-        # Use timm.Mlp with larger hidden dim (matches action encoders)
-        self.encoder = Mlp(
-            in_features=input_dim,
-            hidden_features=output_dim,  # 1024 instead of 512
-            out_features=output_dim,
-            bias=True,
-        )
-
-    def forward(self, state_history: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            state_history: [B, history_len, state_dim] tensor of robot states
-        Returns:
-            embedding: [B, output_dim] tensor
-        """
-        B = state_history.shape[0]
-        flattened = state_history.view(B, -1)  # [B, history_len * state_dim]
-        return self.encoder(flattened)
-
-
 class ProprioVLMTokenizer(nn.Module):
     """Projects proprioception state to VLM embedding dimension for injection into VLM encoder."""
 
@@ -91,16 +50,14 @@ class ProprioVLMTokenizer(nn.Module):
         self.use_history = use_history
         self.history_len = history_len
 
-        # Use timm.Mlp with larger hidden dim (matches action encoders)
-        # Added LayerNorm for stability
-        self.encoder = nn.Sequential(
-            Mlp(
-                in_features=state_dim,
-                hidden_features=vlm_dim,
-                out_features=vlm_dim,
-                bias=True,
-            ),
-            nn.LayerNorm(vlm_dim)
+        # Use timm.Mlp with LayerNorm for stability
+        self.encoder = Mlp(
+            in_features=state_dim,
+            hidden_features=vlm_dim,
+            out_features=vlm_dim,
+            bias=True,
+            norm_layer=nn.LayerNorm,
+            drop=0.2
         )
         logger.info(f"[ProprioVLM] Tokenizer created: state_dim={state_dim}, vlm_dim={vlm_dim}, use_history={use_history}")
 
@@ -144,16 +101,14 @@ class FLOWERVLA(pl.LightningModule):
         use_cross_attn: bool = True,
         use_adaln_cond: bool = False,
         use_readout_token: bool = False,
-        use_proprio: bool = False,
-        use_proprio_history: bool = False,
-        proprio_history_len: int = 5,
-        proprio_state_dim: int = 16,
         return_act_chunk: bool = False,
 
         # Proprio-in-VLM Configuration
         proprio_in_vlm: bool = False,
         proprio_vlm_position: str = "append",
         proprio_vlm_use_history: bool = False,
+        proprio_vlm_history_len: int = 5,
+        proprio_state_dim: int = 16,
         proprio_dropout: float = 0.0,
 
         # DiT Configuration
@@ -196,15 +151,13 @@ class FLOWERVLA(pl.LightningModule):
             token_dropout=token_dropout,
             action_type_adaln=action_type_adaln,
             sampling_type=sampling_type,
-            use_proprio=use_proprio,
-            use_proprio_history=use_proprio_history,
-            proprio_history_len=proprio_history_len,
             proprio_state_dim=proprio_state_dim,
             return_act_chunk=return_act_chunk,
             second_view_key=second_view_key,
             proprio_in_vlm=proprio_in_vlm,
             proprio_vlm_position=proprio_vlm_position,
             proprio_vlm_use_history=proprio_vlm_use_history,
+            proprio_vlm_history_len=proprio_vlm_history_len,
             proprio_dropout=proprio_dropout,
         )
         self.obs_modalities = []
@@ -224,7 +177,6 @@ class FLOWERVLA(pl.LightningModule):
         hidden_dim = self.vlm.config.text_config.d_model
         self.vlm_latent_dim = hidden_dim
         self.action_type_adaln = action_type_adaln
-        self.use_proprio = use_proprio
         # Setup DiT components
         self._setup_dit_components(
             dit_dim=dit_dim,
@@ -381,7 +333,6 @@ class FLOWERVLA(pl.LightningModule):
 
         self.use_adaln_cond = self.use_adaln_cond
         self.use_readout_token = self.use_readout_token and self.use_adaln_cond
-        self.use_proprio = self.use_proprio
         self.use_second_view = self.use_second_view and self.second_view_key is not None
         self.use_cross_attn = self.use_cross_attn
         self.use_rope = self.use_rope and not self.use_nope
@@ -434,7 +385,7 @@ class FLOWERVLA(pl.LightningModule):
                 state_dim=self.proprio_state_dim,
                 vlm_dim=vlm_dim,
                 use_history=self.proprio_vlm_use_history,
-                history_len=self.proprio_history_len,
+                history_len=self.proprio_vlm_history_len,
             )
             logger.info(f"[ProprioVLM] Enabled with position='{self.proprio_vlm_position}', use_history={self.proprio_vlm_use_history}")
         else:
@@ -453,19 +404,8 @@ class FLOWERVLA(pl.LightningModule):
 
         self.action_encoders = nn.ModuleDict()
         self.action_decoders = nn.ModuleDict()
-        if self.use_proprio:
-            self.proprio_encoders = nn.ModuleDict()
 
         self.adaln = nn.ModuleDict() if self.action_type_adaln else None
-
-        # Proprio history encoder (new feature)
-        if self.use_proprio_history:
-            self.proprio_history_encoder = ProprioHistoryEncoder(
-                history_len=self.proprio_history_len,
-                state_dim=self.proprio_state_dim,
-                output_dim=dit_dim,
-            )
-            logger.info(f"[ProprioHistory] Encoder created: history_len={self.proprio_history_len}, state_dim={self.proprio_state_dim}, output_dim={dit_dim}")
 
         # Core components
         self.cond_linear = nn.Linear(hidden_dim, dit_dim, bias=False)
@@ -504,11 +444,6 @@ class FLOWERVLA(pl.LightningModule):
 
             if self.action_type_adaln:
                 self.adaln[action_name] = SharedAdaLNController(dit_dim, global_conddim=dit_dim, use_cross_attn=use_cross_attn)
-
-            if self.use_proprio:
-                # Add proprio encoder if needed for bimanual nav variant otherwise use zero encoder
-                self.proprio_encoders[action_name] = (Mlp(input_dim, dit_dim, out_features=dit_dim, drop=0.2).to(self.device)
-                    if action_name == 'bimanual_nav' else ZeroEncoder(self.dit_dim, device=self.device))
 
     def configure_optimizers(self):
         """Configure optimizers and schedulers"""
@@ -703,22 +638,6 @@ class FLOWERVLA(pl.LightningModule):
         frequency_embeds = cond_dict['frequency_embeds'].squeeze(1).to(default_dtype)
         action_type = cond_dict['action_type'].to(self.device)
 
-        # Handle proprioception - prioritize history over single-frame
-        if self.use_proprio_history and cond_dict.get('proprio_history') is not None:
-            # New: use history-based encoding
-            proprio_history = cond_dict['proprio_history'].to(default_dtype)  # [B, history_len, state_dim]
-            proprio_embeds = self.proprio_history_encoder(proprio_history)  # [B, dit_dim]
-            # Log shapes on first call for verification
-            if not hasattr(self, '_proprio_history_logged'):
-                logger.info(f"[ProprioHistory] Input shape: {proprio_history.shape}, Output shape: {proprio_embeds.shape}")
-                self._proprio_history_logged = True
-        elif self.use_proprio and cond_dict.get('proprio') is not None:
-            # Legacy: single-frame encoding
-            proprio = cond_dict['proprio'].to(default_dtype)
-            proprio_embeds = self.encode_proprio(proprio, action_type, frequency_embeds.shape)
-        else:
-            proprio_embeds = torch.zeros_like(frequency_embeds.squeeze(1))
-
         # Encode actions
         z, valid_dims = self.encode_actions(z, action_type)
 
@@ -728,8 +647,7 @@ class FLOWERVLA(pl.LightningModule):
 
         # Process embeddings
         t_emb = stateless_norm(self.t_embedder(t)) + \
-                stateless_norm(frequency_embeds).squeeze(1) + \
-                stateless_norm(proprio_embeds).squeeze(1)
+                stateless_norm(frequency_embeds).squeeze(1)
 
         cond = self.cond_linear(self.cond_norm(cond))
 
@@ -763,25 +681,6 @@ class FLOWERVLA(pl.LightningModule):
 
         # Decode and return
         return self.decode_actions(cx, action_type, valid_dims)
-
-    def encode_proprio(self, proprio: torch.Tensor, action_type: torch.Tensor, output_shape) -> torch.Tensor:
-        """
-        Encode proprioception based on action type.
-        """
-        batch_size, _ = output_shape
-        default_dtype = next(self.parameters()).dtype
-
-        if not self.use_proprio:
-            return torch.zeros(batch_size, self.dit_dim, device=self.device)
-
-        encoded_proprio = torch.zeros(batch_size, self.dit_dim, device=self.device, dtype=default_dtype)
-
-        for action_name, action_idx in self.action_space_index.action_spaces.items():
-            mask = (action_type == action_idx)
-            if mask.any():
-                encoded_proprio[mask] = self.proprio_encoders[action_name](proprio[mask]).squeeze(1)
-
-        return encoded_proprio
 
     def action_specific_adaln(self, global_cond: torch.Tensor, action_type: torch.Tensor) -> List[torch.Tensor]:
         """
@@ -940,23 +839,11 @@ class FLOWERVLA(pl.LightningModule):
             torch.ones_like(embed_tensor).to(device) * 3
         )
 
-        # Get proprioception if enabled
-        proprio = None
-        proprio_history = None
-        if self.use_proprio_history and 'robot_obs' in batch:
-            # New: extract history from batch
-            proprio_history = batch['robot_obs'].to(device).to(default_type)  # [B, history_len, state_dim]
-        elif self.use_proprio and 'robot_obs' in batch:
-            # Legacy: single frame
-            proprio = batch['robot_obs'][:, -1, :].to(device).to(default_type)  # [B, state_dim]
-
         return {
             'features': features,
             'frequency_embeds': frequency_embeds,
             'action_space_embeds': None,
-            'action_type': torch.ones_like(action_type_tensor), # actiont ype is always 1
-            'proprio': proprio,
-            'proprio_history': proprio_history,
+            'action_type': torch.ones_like(action_type_tensor), # action type is always 1
             'attention_mask': attention_mask,
         }
 
@@ -1031,7 +918,7 @@ class FLOWERVLA(pl.LightningModule):
                 if self.proprio_history_buffer is None:
                     # First step: initialize buffer with zeros (more stable than repeating first obs)
                     self.proprio_history_buffer = torch.zeros(
-                        robot_obs.shape[0], self.proprio_history_len, robot_obs.shape[-1],
+                        robot_obs.shape[0], self.proprio_vlm_history_len, robot_obs.shape[-1],
                         device=robot_obs.device, dtype=robot_obs.dtype
                     )
                 # Shift buffer: remove oldest, append newest (FIFO)
@@ -1086,25 +973,15 @@ class FLOWERVLA(pl.LightningModule):
         return current_action
 
     def reset(self):
-        """Reset model state for new subtask.
-
-        Keeps proprio_history_buffer intact since robot state is continuous
-        across subtasks within the same evaluation sequence.
-        """
+        """Reset model state for new subtask."""
         self.rollout_step_counter = 0
         self.pred_action_seq = None
-        # Don't reset proprio_history_buffer - keep rolling history across subtasks
         self.eval()
 
     def reset_sequence(self):
-        """Full reset for new evaluation sequence.
-
-        Call this at the start of a new multi-subtask sequence to clear
-        the proprio history buffer completely.
-        """
+        """Full reset for new evaluation sequence."""
         self.reset()
         self.proprio_history_buffer = None
-        logger.info("[ProprioBuffer] reset_sequence() called - buffer cleared")
 
     def on_train_start(self):
         """Convert model to appropriate dtype on training start."""

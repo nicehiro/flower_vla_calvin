@@ -29,18 +29,15 @@ use_causal_attention: true
 use_cross_attn: True
 use_adaln_cond: false
 use_readout_token: false
-use_proprio: false
-# Proprioception History (new feature)
-use_proprio_history: false     # Enable history-based proprio encoding
-proprio_history_len: 5         # Number of history frames
-proprio_state_dim: 15          # State dimension per frame (CALVIN robot_obs is 15D)
 return_act_chunk: false
 
 # Proprioception in VLM (inject proprio into vision-language encoder)
-proprio_in_vlm: true            # Enable proprio injection into VLM
-proprio_vlm_position: "append"   # prepend | between | append (relative to text)
-proprio_vlm_use_history: true   # Use full history (5 frames) or just current state (1 frame)
-proprio_dropout: 0.5            # Probability of dropping proprioceptive tokens during training
+proprio_in_vlm: true              # Enable proprio injection into VLM
+proprio_vlm_position: "append"    # prepend | between | append (relative to text)
+proprio_vlm_use_history: true     # Use full history or just current state
+proprio_vlm_history_len: 5        # Number of history frames for VLM tokenizer
+proprio_state_dim: 15             # State dimension per frame (CALVIN robot_obs is 15D)
+proprio_dropout: 0.5              # Probability of dropping proprio tokens during training
 
 # DiT Configuration
 sampling_type: uniform
