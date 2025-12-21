@@ -31,9 +31,10 @@ use_adaln_cond: false
 use_readout_token: false
 use_proprio: false
 # Proprioception History (new feature)
-use_proprio_history: True     # Enable history-based proprio encoding
+use_proprio_history: True      # Enable history-based proprio encoding
 proprio_history_len: 5         # Number of history frames
 proprio_state_dim: 15          # State dimension per frame (CALVIN robot_obs is 15D)
+proprio_dropout: 0.1           # Element-wise dropout for proprio embeddings during training
 return_act_chunk: false
 
 # DiT Configuration

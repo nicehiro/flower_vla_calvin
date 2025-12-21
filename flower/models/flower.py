@@ -47,22 +47,27 @@ class ProprioHistoryEncoder(nn.Module):
     # to learn which historical states are relevant for each predicted action.
     """
 
-    def __init__(self, history_len: int, state_dim: int, output_dim: int):
+    def __init__(self, history_len: int, state_dim: int, output_dim: int, dropout: float = 0.0):
         """
         Args:
             history_len: Number of history frames (e.g., 5)
-            state_dim: Dimension of state per frame (e.g., 16 for CALVIN)
+            state_dim: Dimension of state per frame (e.g., 15 for CALVIN)
             output_dim: Output embedding dimension (e.g., 1024 = dit_dim)
+            dropout: Dropout probability for regularization (applied during training only)
         """
         super().__init__()
         input_dim = history_len * state_dim
 
         # Use timm.Mlp with larger hidden dim (matches action encoders)
-        self.encoder = Mlp(
-            in_features=input_dim,
-            hidden_features=output_dim,  # 1024 instead of 512
-            out_features=output_dim,
-            bias=True,
+        # Add dropout for regularization (only active during training)
+        self.encoder = nn.Sequential(
+            Mlp(
+                in_features=input_dim,
+                hidden_features=output_dim,  # 1024 instead of 512
+                out_features=output_dim,
+                bias=True,
+            ),
+            nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity(),
         )
 
     def forward(self, state_history: torch.Tensor) -> torch.Tensor:
@@ -103,7 +108,8 @@ class FLOWERVLA(pl.LightningModule):
         use_proprio: bool = False,
         use_proprio_history: bool = False,
         proprio_history_len: int = 5,
-        proprio_state_dim: int = 16,
+        proprio_state_dim: int = 15,
+        proprio_dropout: float = 0.0,
         return_act_chunk: bool = False,
         # DiT Configuration
         sampling_type: str = "ln",
@@ -146,6 +152,7 @@ class FLOWERVLA(pl.LightningModule):
             use_proprio_history=use_proprio_history,
             proprio_history_len=proprio_history_len,
             proprio_state_dim=proprio_state_dim,
+            proprio_dropout=proprio_dropout,
             return_act_chunk=return_act_chunk,
             second_view_key=second_view_key,
         )
@@ -431,9 +438,11 @@ class FLOWERVLA(pl.LightningModule):
                 history_len=self.proprio_history_len,
                 state_dim=self.proprio_state_dim,
                 output_dim=dit_dim,
+                dropout=self.proprio_dropout,
             )
             logger.info(
-                f"[ProprioHistory] Encoder created: history_len={self.proprio_history_len}, state_dim={self.proprio_state_dim}, output_dim={dit_dim}"
+                f"[ProprioHistory] Encoder created: history_len={self.proprio_history_len}, "
+                f"state_dim={self.proprio_state_dim}, output_dim={dit_dim}, dropout={self.proprio_dropout}"
             )
 
         # Core components
@@ -1018,20 +1027,24 @@ class FLOWERVLA(pl.LightningModule):
         if self.use_proprio_history and "robot_obs" in obs:
             robot_obs = obs["robot_obs"]
             # Wrapper provides [B, state_dim], we need [B, history_len, state_dim]
-            if len(robot_obs.shape) == 2:
+            if robot_obs.dim() == 2:
                 robot_obs = robot_obs.unsqueeze(1)  # [B, 1, state_dim]
 
-            if self.proprio_history_buffer is None:
-                self.proprio_history_buffer = torch.zeros(
-                    robot_obs.shape[0], self.proprio_history_len, robot_obs.shape[-1],
-                    device=robot_obs.device, dtype=robot_obs.dtype
-                )
-            self.proprio_history_buffer = torch.cat([
-                self.proprio_history_buffer[:, 1:, :],
-                robot_obs
-            ], dim=1)
-
-            robot_obs = self.proprio_history_buffer
+            # Only update buffer during inference with single-frame input
+            # During training, dataloader already provides full history
+            if not self.training and robot_obs.shape[1] == 1:
+                if self.proprio_history_buffer is None:
+                    # First step: initialize buffer with zeros
+                    self.proprio_history_buffer = torch.zeros(
+                        robot_obs.shape[0], self.proprio_history_len, robot_obs.shape[-1],
+                        device=robot_obs.device, dtype=robot_obs.dtype
+                    )
+                # Shift buffer: remove oldest, append newest (FIFO)
+                self.proprio_history_buffer = torch.cat([
+                    self.proprio_history_buffer[:, 1:, :],  # Keep last (history_len-1) frames
+                    robot_obs  # Add current frame
+                ], dim=1)
+                robot_obs = self.proprio_history_buffer
 
             batch["robot_obs"] = robot_obs
 
