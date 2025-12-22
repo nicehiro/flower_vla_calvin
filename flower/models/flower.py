@@ -35,45 +35,81 @@ from flower.models.utils import ActionIndex, generate_policy_prompt
 
 logger = logging.getLogger(__name__)
 
-class ProprioVLMTokenizer(nn.Module):
-    """Projects proprioception state to VLM embedding dimension for injection into VLM encoder."""
+class ProprioTextTokenizer(nn.Module):
+    """Discretizes proprio state into bins and uses VLM text embeddings.
+    
+    Following RT-2/OpenVLA approach: discretize continuous values into bins
+    and reuse the last N tokens of the VLM vocabulary.
+    """
 
-    def __init__(self, state_dim: int, vlm_dim: int, use_history: bool = False, history_len: int = 5):
+    def __init__(
+        self,
+        tokenizer,
+        vlm_embeddings: nn.Module,
+        state_dim: int = 15,
+        num_bins: int = 256,
+        min_value: float = -3.0,
+        max_value: float = 3.0,
+        use_history: bool = True,
+        history_len: int = 5,
+    ):
         """
         Args:
+            tokenizer: VLM tokenizer (for vocab_size)
+            vlm_embeddings: VLM input embedding layer
             state_dim: Dimension of state per frame (e.g., 15 for CALVIN)
-            vlm_dim: VLM embedding dimension (1024 for Florence-2-large)
+            num_bins: Number of discretization bins (default 256)
+            min_value: Minimum value for clipping (default -3.0 for normalized)
+            max_value: Maximum value for clipping (default 3.0 for normalized)
             use_history: If True, tokenize full history; if False, only current state
             history_len: Number of history frames when use_history=True
         """
         super().__init__()
+        self.state_dim = state_dim
+        self.num_bins = num_bins
+        self.min_value = min_value
+        self.max_value = max_value
         self.use_history = use_history
         self.history_len = history_len
+        
+        # Store reference to VLM embeddings (shared, not copied)
+        self.vlm_embeddings = vlm_embeddings
+        self.vocab_size = tokenizer.vocab_size
+        
+        logger.info(f"[ProprioTextTokenizer] Created: bins={num_bins}, "
+                    f"range=[{min_value}, {max_value}], vocab_size={self.vocab_size}")
 
-        # Use timm.Mlp with LayerNorm for stability
-        self.encoder = Mlp(
-            in_features=state_dim,
-            hidden_features=vlm_dim,
-            out_features=vlm_dim,
-            bias=True,
-            norm_layer=nn.LayerNorm,
-            drop=0.2
-        )
-        logger.info(f"[ProprioVLM] Tokenizer created: state_dim={state_dim}, vlm_dim={vlm_dim}, use_history={use_history}")
+    def discretize(self, values: torch.Tensor) -> torch.Tensor:
+        """Convert continuous values to bin indices [0, num_bins-1]."""
+        clipped = torch.clamp(values, self.min_value, self.max_value)
+        normalized = (clipped - self.min_value) / (self.max_value - self.min_value)
+        bin_indices = (normalized * (self.num_bins - 1)).long()
+        return bin_indices
 
     def forward(self, proprio: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            proprio: [B, state_dim] if use_history=False, [B, history_len, state_dim] if use_history=True
+            proprio: [B, state_dim] or [B, history_len, state_dim]
         Returns:
-            tokens: [B, 1, vlm_dim] or [B, history_len, vlm_dim]
+            tokens: [B, state_dim, vlm_dim] or [B, history_len * state_dim, vlm_dim]
         """
-        if self.use_history:
-            # proprio is [B, history_len, state_dim]
-            return self.encoder(proprio)  # [B, history_len, vlm_dim]
-        else:
-            # proprio is [B, state_dim]
-            return self.encoder(proprio).unsqueeze(1)  # [B, 1, vlm_dim]
+        if not self.use_history:
+            proprio = proprio.unsqueeze(1)  # [B, 1, state_dim]
+        
+        B, T, D = proprio.shape  # T = history_len or 1
+        
+        # Discretize to bin indices [0, num_bins-1]
+        bin_indices = self.discretize(proprio)  # [B, T, D]
+        
+        # Map to last num_bins tokens of vocabulary (like OpenVLA)
+        token_ids = self.vocab_size - 1 - bin_indices  # [B, T, D]
+        
+        # Get embeddings from VLM
+        embeddings = self.vlm_embeddings(token_ids)  # [B, T, D, vlm_dim]
+        
+        # Reshape to [B, T*D, vlm_dim]
+        vlm_dim = embeddings.shape[-1]
+        return embeddings.view(B, T * D, vlm_dim)
 
 
 class FLOWERVLA(pl.LightningModule):
@@ -108,7 +144,10 @@ class FLOWERVLA(pl.LightningModule):
         proprio_vlm_position: str = "append",
         proprio_vlm_use_history: bool = False,
         proprio_vlm_history_len: int = 5,
-        proprio_state_dim: int = 16,
+        proprio_state_dim: int = 15,
+        proprio_num_bins: int = 256,
+        proprio_min_value: float = -3.0,
+        proprio_max_value: float = 3.0,
         proprio_dropout: float = 0.0,
 
         # DiT Configuration
@@ -158,6 +197,9 @@ class FLOWERVLA(pl.LightningModule):
             proprio_vlm_position=proprio_vlm_position,
             proprio_vlm_use_history=proprio_vlm_use_history,
             proprio_vlm_history_len=proprio_vlm_history_len,
+            proprio_num_bins=proprio_num_bins,
+            proprio_min_value=proprio_min_value,
+            proprio_max_value=proprio_max_value,
             proprio_dropout=proprio_dropout,
         )
         self.obs_modalities = []
@@ -380,10 +422,13 @@ class FLOWERVLA(pl.LightningModule):
 
         # Initialize proprio-in-VLM tokenizer if enabled
         if self.proprio_in_vlm:
-            vlm_dim = self.vlm.config.text_config.d_model  # 1024 for Florence-2-large
-            self.proprio_vlm_tokenizer = ProprioVLMTokenizer(
+            self.proprio_vlm_tokenizer = ProprioTextTokenizer(
+                tokenizer=self.tokenizer,
+                vlm_embeddings=self.vlm.get_input_embeddings(),
                 state_dim=self.proprio_state_dim,
-                vlm_dim=vlm_dim,
+                num_bins=self.proprio_num_bins,
+                min_value=self.proprio_min_value,
+                max_value=self.proprio_max_value,
                 use_history=self.proprio_vlm_use_history,
                 history_len=self.proprio_vlm_history_len,
             )
@@ -768,11 +813,19 @@ class FLOWERVLA(pl.LightningModule):
                     logger.info(f"[ProprioVLM] Using current state mode: current_state shape: {current_state.shape}")
                     self._proprio_vlm_input_logged = True
 
-            # Apply dropout to proprioceptive tokens if training
+            # Apply per-frame dropout to proprioceptive tokens if training
+            # Each frame (state_dim tokens) is dropped together to maintain spatial coherence
             if self.training and self.proprio_dropout > 0.0:
-                 # Create a binary mask with probability (1 - p) of keeping the token
-                mask = torch.bernoulli(torch.ones(proprio_vlm_tokens.shape[0], 1, 1, device=device) * (1 - self.proprio_dropout))
-                proprio_vlm_tokens = proprio_vlm_tokens * mask
+                # Determine number of frames
+                T = robot_obs.shape[1] if self.proprio_vlm_use_history else 1
+                # Create per-frame mask: [B, T, 1]
+                frame_mask = torch.bernoulli(
+                    torch.ones(B, T, 1, device=device) * (1 - self.proprio_dropout)
+                )
+                # Expand to cover all dims per frame: [B, T, state_dim] -> [B, T*state_dim]
+                frame_mask = frame_mask.expand(-1, -1, self.proprio_state_dim).reshape(B, -1)
+                # Apply to tokens: [B, T*state_dim, vlm_dim] * [B, T*state_dim, 1]
+                proprio_vlm_tokens = proprio_vlm_tokens * frame_mask.unsqueeze(-1)
 
         # Get text embeddings
         # Get text embeddings once to reuse

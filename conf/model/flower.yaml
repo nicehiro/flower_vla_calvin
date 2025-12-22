@@ -32,12 +32,16 @@ use_readout_token: false
 return_act_chunk: false
 
 # Proprioception in VLM (inject proprio into vision-language encoder)
+# Uses text tokenization: discretizes proprio values into bins and uses VLM embeddings
 proprio_in_vlm: true              # Enable proprio injection into VLM
 proprio_vlm_position: "append"    # prepend | between | append (relative to text)
 proprio_vlm_use_history: true     # Use full history or just current state
 proprio_vlm_history_len: 5        # Number of history frames for VLM tokenizer
 proprio_state_dim: 15             # State dimension per frame (CALVIN robot_obs is 15D)
-proprio_dropout: 0.5              # Probability of dropping proprio tokens during training
+proprio_num_bins: 256             # Number of discretization bins (like RT-2/OpenVLA)
+proprio_min_value: -3.0           # Min value for normalized proprio (clips to this)
+proprio_max_value: 3.0            # Max value for normalized proprio (clips to this)
+proprio_dropout: 0.5              # Per-frame dropout probability during training
 
 # DiT Configuration
 sampling_type: uniform
