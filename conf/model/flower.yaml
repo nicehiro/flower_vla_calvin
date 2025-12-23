@@ -41,6 +41,14 @@ vl_selection_k: 64                # Top-K VL tokens to keep (out of ~650)
 vl_selection_use_residual: true   # Add global mean-pooled token to preserve info
 vl_selection_use_temporal_attn: true  # Use temporal self-attention in proprio encoder
 vl_selection_per_layer: false     # If True, select per DiT layer (future extension)
+# Selection mode options:
+#   - proprio_topk: Proprio-guided top-K selection (default)
+#   - random: Random K tokens per sample (ablation baseline)
+#   - mean_pool: Mean pool all VL tokens to single token
+#   - max_pool: Select top-K tokens based on max feature values
+#   - soft_topk_ste: Straight-Through Estimator for differentiable selection
+#   - soft_topk_gumbel: Gumbel-Softmax for differentiable selection
+vl_selection_mode: "proprio_topk"
 
 # Proprio configuration
 proprio_history_len: 5            # Number of history frames (1 = current state only)

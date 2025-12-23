@@ -72,6 +72,7 @@ class FLOWERVLA(pl.LightningModule):
         vl_selection_use_residual: bool = True,
         vl_selection_use_temporal_attn: bool = True,
         vl_selection_per_layer: bool = False,
+        vl_selection_mode: str = "proprio_topk",  # proprio_topk | random | mean_pool | max_pool | soft_topk_ste | soft_topk_gumbel
         proprio_history_len: int = 5,
         proprio_state_dim: int = 15,
         proprio_dropout: float = 0.0,
@@ -124,6 +125,7 @@ class FLOWERVLA(pl.LightningModule):
             vl_selection_use_residual=vl_selection_use_residual,
             vl_selection_use_temporal_attn=vl_selection_use_temporal_attn,
             vl_selection_per_layer=vl_selection_per_layer,
+            vl_selection_mode=vl_selection_mode,
             proprio_history_len=proprio_history_len,
             proprio_state_dim=proprio_state_dim,
             proprio_dropout=proprio_dropout,
@@ -347,7 +349,7 @@ class FLOWERVLA(pl.LightningModule):
 
         # Log proprio configuration
         if self.use_proprio_vl_selection:
-            logger.info(f"[ProprioVLSelection] Enabled with K={self.vl_selection_k}, residual={self.vl_selection_use_residual}")
+            logger.info(f"[ProprioVLSelection] Enabled with mode='{self.vl_selection_mode}', K={self.vl_selection_k}, residual={self.vl_selection_use_residual}")
         else:
             logger.info("[ProprioVLSelection] Disabled")
 
@@ -369,25 +371,40 @@ class FLOWERVLA(pl.LightningModule):
 
         # Proprio-Guided VL Selection modules
         if self.use_proprio_vl_selection:
-            self.proprio_encoder = ProprioHistoryEncoder(
-                state_dim=self.proprio_state_dim,
-                output_dim=dit_dim,
-                n_heads=8,
-                dropout=self.proprio_dropout,
-                use_temporal_attn=self.vl_selection_use_temporal_attn,
-            )
+            # Modes that require proprio encoding
+            proprio_based_modes = ["proprio_topk", "soft_topk_ste", "soft_topk_gumbel"]
+            
+            # Only create proprio_encoder for modes that need it
+            if self.vl_selection_mode in proprio_based_modes:
+                self.proprio_encoder = ProprioHistoryEncoder(
+                    state_dim=self.proprio_state_dim,
+                    output_dim=dit_dim,
+                    n_heads=8,
+                    dropout=self.proprio_dropout,
+                    use_temporal_attn=self.vl_selection_use_temporal_attn,
+                )
+                logger.info(
+                    f"[ProprioVLSelection] proprio_encoder initialized: "
+                    f"state_dim={self.proprio_state_dim}, output_dim={dit_dim}, "
+                    f"temporal_attn={self.vl_selection_use_temporal_attn}"
+                )
+            else:
+                self.proprio_encoder = None
+                logger.info(
+                    f"[ProprioVLSelection] proprio_encoder skipped for mode='{self.vl_selection_mode}'"
+                )
+            
             self.vl_selector = ProprioGuidedVLSelector(
                 dim=dit_dim,
                 n_heads=8,
                 top_k=self.vl_selection_k,
                 use_residual=self.vl_selection_use_residual,
                 attn_dropout=0.1,
+                mode=self.vl_selection_mode,
             )
             logger.info(
-                f"[ProprioVLSelection] Modules initialized: "
-                f"proprio_encoder(state_dim={self.proprio_state_dim}, output_dim={dit_dim}, "
-                f"temporal_attn={self.vl_selection_use_temporal_attn}), "
-                f"vl_selector(top_k={self.vl_selection_k}, residual={self.vl_selection_use_residual})"
+                f"[ProprioVLSelection] vl_selector initialized: "
+                f"mode='{self.vl_selection_mode}', top_k={self.vl_selection_k}, residual={self.vl_selection_use_residual}"
             )
 
         # Core components
@@ -636,17 +653,29 @@ class FLOWERVLA(pl.LightningModule):
         cond = self.cond_linear(self.cond_norm(cond))
 
         # === Proprio-Guided VL Selection ===
-        if self.use_proprio_vl_selection and cond_dict.get('proprio_history') is not None:
-            proprio_history = cond_dict['proprio_history'].to(default_dtype)
-            # Encode proprio history into query tokens
-            proprio_tokens = self.proprio_encoder(proprio_history)  # [B, H, dit_dim]
-            # Select top-K VL tokens using proprio as query
-            context = self.vl_selector(proprio_tokens, cond)  # [B, K+1, dit_dim]
+        if self.use_proprio_vl_selection:
+            # Encode proprio if encoder exists (proprio-based modes)
+            if self.proprio_encoder is not None:
+                # These modes need proprio_history
+                if cond_dict.get('proprio_history') is None:
+                    raise ValueError(
+                        f"vl_selection_mode='{self.vl_selection_mode}' requires proprio_history in batch, "
+                        f"but it was not provided."
+                    )
+                proprio_history = cond_dict['proprio_history'].to(default_dtype)
+                proprio_tokens = self.proprio_encoder(proprio_history)  # [B, H, dit_dim]
+            else:
+                # Modes that don't use proprio (random, mean_pool, max_pool)
+                proprio_tokens = None
+            
+            # Select VL tokens using the configured mode
+            context = self.vl_selector(proprio_tokens, cond)
 
             # Log compression ratio on first call
             if not hasattr(self, '_vl_selection_forward_logged'):
                 logger.info(
-                    f"[ProprioVLSelection] VL tokens: {cond.shape[1]} -> Selected: {context.shape[1]} "
+                    f"[ProprioVLSelection] mode='{self.vl_selection_mode}' | "
+                    f"VL tokens: {cond.shape[1]} -> Selected: {context.shape[1]} "
                     f"(compression: {cond.shape[1] / context.shape[1]:.1f}x)"
                 )
                 self._vl_selection_forward_logged = True

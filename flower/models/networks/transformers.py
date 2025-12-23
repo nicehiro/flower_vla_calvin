@@ -496,13 +496,24 @@ class ProprioGuidedVLSelector(nn.Module):
     VL tokens to K+1 selected tokens, while using proprio state to guide
     which visual/language features are most relevant for action prediction.
 
+    Supports multiple selection modes for ablation studies:
+        - proprio_topk: Proprio-guided top-K selection (default)
+        - random: Random K tokens per sample (ablation baseline)
+        - mean_pool: Mean pool all VL tokens to single token
+        - max_pool: Select top-K tokens based on max feature values
+        - soft_topk_ste: Straight-Through Estimator for differentiable selection
+        - soft_topk_gumbel: Gumbel-Softmax for differentiable selection
+
     Args:
         dim: Model dimension (dit_dim, e.g., 1024)
         n_heads: Number of attention heads for cross-attention
         top_k: Number of VL tokens to select
         use_residual: If True, append a global mean-pooled token to preserve info
         attn_dropout: Dropout probability for attention
+        mode: Selection mode (see above)
     """
+
+    VALID_MODES = ["proprio_topk", "random", "mean_pool", "max_pool", "soft_topk_ste", "soft_topk_gumbel"]
 
     def __init__(
         self,
@@ -511,30 +522,32 @@ class ProprioGuidedVLSelector(nn.Module):
         top_k: int = 64,
         use_residual: bool = True,
         attn_dropout: float = 0.1,
+        mode: str = "proprio_topk",
     ):
         super().__init__()
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"Invalid vl_selection_mode: '{mode}'. Must be one of {self.VALID_MODES}")
+
         self.dim = dim
         self.top_k = top_k
         self.use_residual = use_residual
+        self.mode = mode
+        self._forward_logged = False  # For logging on first forward pass
 
         # Cross-attention: proprio queries attend to VL tokens
-        self.cross_attn = FlowerCrossAttention(
-            dim=dim,
-            n_heads=n_heads,
-            attn_pdrop=attn_dropout,
-            resid_pdrop=attn_dropout,
-            use_rope=False,
-        )
-
-        # Score projection: compute importance score per VL token
-        self.score_proj = nn.Sequential(
-            nn.Linear(dim, dim // 4),
-            nn.GELU(),
-            nn.Linear(dim // 4, 1),
-        )
+        # Only needed for proprio-based modes
+        if mode in ["proprio_topk", "soft_topk_ste", "soft_topk_gumbel"]:
+            self.cross_attn = FlowerCrossAttention(
+                dim=dim,
+                n_heads=n_heads,
+                attn_pdrop=attn_dropout,
+                resid_pdrop=attn_dropout,
+                use_rope=False,
+            )
 
         # Global context projection for residual connection
-        if use_residual:
+        # Used by proprio_topk, max_pool, soft_topk_ste, soft_topk_gumbel
+        if use_residual and mode not in ["mean_pool", "random"]:
             self.global_proj = nn.Sequential(
                 nn.Linear(dim, dim),
                 nn.LayerNorm(dim),
@@ -542,55 +555,203 @@ class ProprioGuidedVLSelector(nn.Module):
 
     def forward(
         self,
-        proprio_tokens: torch.Tensor,
+        proprio_tokens: Optional[torch.Tensor],
         vl_tokens: torch.Tensor,
         return_scores: bool = False,
     ):
         """
         Args:
             proprio_tokens: [B, H, dim] - encoded proprio history (queries)
-            vl_tokens: [B, N, dim] - VLM features (keys/values), N ≈ 650
+                           Can be None for modes that don't use proprio (random, mean_pool, max_pool)
+            vl_tokens: [B, N, dim] - VLM features (keys/values), N ~ 650
             return_scores: If True, also return attention scores for visualization
 
         Returns:
-            selected_context: [B, K+1, dim] if use_residual else [B, K, dim]
+            selected_context: [B, K+1, dim], [B, K, dim], or [B, 1, dim] depending on mode
             (optional) scores: [B, N] softmax attention scores if return_scores=True
         """
         B, N, D = vl_tokens.shape
         K = min(self.top_k, N)  # Handle edge case where N < top_k
 
-        # Step 1: Cross-attention - proprio tokens attend to all VL tokens
-        # This produces a proprio-weighted view of the VL features
+        if self.mode == "proprio_topk":
+            return self._proprio_topk(proprio_tokens, vl_tokens, K, return_scores)
+        elif self.mode == "random":
+            return self._random_select(vl_tokens, K, return_scores)
+        elif self.mode == "mean_pool":
+            return self._mean_pool(vl_tokens, return_scores)
+        elif self.mode == "max_pool":
+            return self._max_pool(vl_tokens, K, return_scores)
+        elif self.mode == "soft_topk_ste":
+            return self._soft_topk_ste(proprio_tokens, vl_tokens, K, return_scores)
+        elif self.mode == "soft_topk_gumbel":
+            return self._soft_topk_gumbel(proprio_tokens, vl_tokens, K, return_scores)
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+    def _proprio_topk(self, proprio_tokens, vl_tokens, K, return_scores):
+        """Proprio-guided top-K selection (default behavior)."""
+        B, N, D = vl_tokens.shape
+
+        # Cross-attention: proprio tokens attend to all VL tokens
         attended = self.cross_attn(proprio_tokens, vl_tokens)  # [B, H, D]
 
-        # Step 2: Compute relevance scores for each VL token
-        # Pool proprio attention across history frames to get a summary
+        # Compute relevance scores
         proprio_summary = attended.mean(dim=1)  # [B, D]
-
-        # Score each VL token by dot-product similarity with proprio summary
-        # This measures how relevant each VL token is to the current state
         scores = torch.einsum('bd,bnd->bn', proprio_summary, vl_tokens)  # [B, N]
-        scores = scores / (D ** 0.5)  # Scale by sqrt(dim) for stability
+        scores = scores / (D ** 0.5)
         scores_softmax = F.softmax(scores, dim=-1)
 
-        # Step 3: Top-K selection
-        # Hard selection - gradients flow through the scoring mechanism
+        # Top-K selection
         _, topk_indices = scores_softmax.topk(K, dim=-1)  # [B, K]
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
+        selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)
 
-        # Gather selected tokens using indices
-        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)  # [B, K, D]
-        selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
-
-        # Step 4: Add global residual token to preserve information
+        # Add residual
         if self.use_residual:
-            # Mean-pool all VL tokens and project
-            global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))  # [B, 1, D]
-            selected_context = torch.cat([selected_tokens, global_ctx], dim=1)  # [B, K+1, D]
+            global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))
+            selected_context = torch.cat([selected_tokens, global_ctx], dim=1)
         else:
-            selected_context = selected_tokens  # [B, K, D]
+            selected_context = selected_tokens
 
         if return_scores:
             return selected_context, scores_softmax
+        return selected_context
+
+    def _random_select(self, vl_tokens, K, return_scores):
+        """Random selection - different random tokens for each sample in batch."""
+        B, N, D = vl_tokens.shape
+
+        # Generate random indices per sample
+        random_indices = torch.stack([
+            torch.randperm(N, device=vl_tokens.device)[:K] for _ in range(B)
+        ])  # [B, K]
+        random_indices_expanded = random_indices.unsqueeze(-1).expand(-1, -1, D)
+        selected_tokens = torch.gather(vl_tokens, dim=1, index=random_indices_expanded)
+
+        # No residual for random mode (doesn't make sense to add learned projection)
+        if return_scores:
+            # Return uniform scores for compatibility
+            uniform_scores = torch.ones(B, N, device=vl_tokens.device) / N
+            return selected_tokens, uniform_scores
+        return selected_tokens
+
+    def _mean_pool(self, vl_tokens, return_scores):
+        """Mean pool all VL tokens to single token."""
+        B, N, D = vl_tokens.shape
+
+        # Simple mean pooling
+        pooled = vl_tokens.mean(dim=1, keepdim=True)  # [B, 1, D]
+
+        if return_scores:
+            uniform_scores = torch.ones(B, N, device=vl_tokens.device) / N
+            return pooled, uniform_scores
+        return pooled
+
+    def _max_pool(self, vl_tokens, K, return_scores):
+        """Select top-K tokens based on max feature values (L-inf norm as score)."""
+        B, N, D = vl_tokens.shape
+
+        # Compute score as max absolute value per token (L-inf norm)
+        scores = vl_tokens.abs().max(dim=-1)[0]  # [B, N]
+        scores_softmax = F.softmax(scores, dim=-1)
+
+        # Top-K selection based on max scores
+        _, topk_indices = scores.topk(K, dim=-1)  # [B, K]
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
+        selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)
+
+        # Add residual
+        if self.use_residual:
+            global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))
+            selected_context = torch.cat([selected_tokens, global_ctx], dim=1)
+        else:
+            selected_context = selected_tokens
+
+        if return_scores:
+            return selected_context, scores_softmax
+        return selected_context
+
+    def _soft_topk_ste(self, proprio_tokens, vl_tokens, K, return_scores):
+        """Straight-Through Estimator: hard forward, soft backward."""
+        B, N, D = vl_tokens.shape
+
+        # Compute scores (same as proprio_topk)
+        attended = self.cross_attn(proprio_tokens, vl_tokens)
+        proprio_summary = attended.mean(dim=1)
+        scores = torch.einsum('bd,bnd->bn', proprio_summary, vl_tokens)
+        scores = scores / (D ** 0.5)
+        scores_softmax = F.softmax(scores, dim=-1)  # [B, N]
+
+        # Hard top-K selection (forward pass)
+        _, topk_indices = scores_softmax.topk(K, dim=-1)
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
+        selected_hard = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
+
+        # STE: Create soft gradient path
+        # Compute weighted sum of ALL tokens for gradient flow
+        soft_weighted = torch.einsum('bn,bnd->bd', scores_softmax, vl_tokens)  # [B, D]
+
+        # Straight-through trick: forward uses hard selection, backward uses soft gradient
+        # Add zero-valued term that creates gradient path: (soft - soft.detach()) = 0 in forward
+        selected_tokens = selected_hard + (soft_weighted.unsqueeze(1) - soft_weighted.unsqueeze(1).detach())
+
+        # Add residual
+        if self.use_residual:
+            global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))
+            selected_context = torch.cat([selected_tokens, global_ctx], dim=1)
+        else:
+            selected_context = selected_tokens
+
+        if return_scores:
+            return selected_context, scores_softmax
+        return selected_context
+
+    def _soft_topk_gumbel(self, proprio_tokens, vl_tokens, K, return_scores):
+        """Gumbel-Softmax for differentiable selection."""
+        B, N, D = vl_tokens.shape
+        temperature = 1.0  # Fixed temperature
+
+        # Compute scores
+        attended = self.cross_attn(proprio_tokens, vl_tokens)
+        proprio_summary = attended.mean(dim=1)
+        scores = torch.einsum('bd,bnd->bn', proprio_summary, vl_tokens)
+        scores = scores / (D ** 0.5)
+
+        # Add Gumbel noise during training for exploration
+        if self.training:
+            # Gumbel(0, 1) = -log(-log(U)), U ~ Uniform(0, 1)
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(scores) + 1e-8) + 1e-8)
+            perturbed_scores = (scores + gumbel_noise) / temperature
+        else:
+            perturbed_scores = scores / temperature
+
+        # Soft weights via softmax
+        soft_weights = F.softmax(perturbed_scores, dim=-1)  # [B, N]
+
+        # Hard top-K selection for indices (still needed for output shape)
+        _, topk_indices = soft_weights.topk(K, dim=-1)  # [B, K]
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
+
+        # Get selected tokens
+        selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
+
+        # Get corresponding soft weights for gradient flow
+        topk_weights = torch.gather(soft_weights, dim=1, index=topk_indices)  # [B, K]
+        topk_weights_norm = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # Multiply selected tokens by normalized soft weights for gradient flow
+        # This makes the selection differentiable through the weights
+        selected_tokens = selected_tokens * topk_weights_norm.unsqueeze(-1)
+
+        # Add residual
+        if self.use_residual:
+            global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))
+            selected_context = torch.cat([selected_tokens, global_ctx], dim=1)
+        else:
+            selected_context = selected_tokens
+
+        if return_scores:
+            return selected_context, soft_weights
         return selected_context
 
 
