@@ -418,6 +418,181 @@ class FlowBlock(nn.Module):
         return x_final
 
 
+###############################################################################
+# Proprio-Guided VL Selection Modules
+###############################################################################
+
+
+class ProprioHistoryEncoder(nn.Module):
+    """Encodes proprio history frames into rich query tokens for VL selection.
+
+    Each frame is encoded independently via MLP, then optional temporal self-attention
+    is applied to capture dynamics (velocity, acceleration patterns). The resulting
+    tokens serve as queries for selecting relevant VL tokens.
+
+    Args:
+        state_dim: Dimension of state per frame (e.g., 15 for CALVIN)
+        output_dim: Output embedding dimension (e.g., 1024 = dit_dim)
+        n_heads: Number of attention heads for temporal attention
+        dropout: Dropout probability
+        use_temporal_attn: If True, apply self-attention across history frames
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        output_dim: int,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        use_temporal_attn: bool = True,
+    ):
+        super().__init__()
+        self.use_temporal_attn = use_temporal_attn
+
+        # Per-frame encoder: state_dim -> output_dim
+        self.frame_encoder = nn.Sequential(
+            nn.Linear(state_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim),
+            nn.Dropout(dropout),
+        )
+
+        # Optional: temporal self-attention across frames for dynamics awareness
+        if use_temporal_attn:
+            self.temporal_attn = nn.MultiheadAttention(
+                output_dim, num_heads=n_heads, dropout=dropout, batch_first=True
+            )
+            self.temporal_norm = nn.LayerNorm(output_dim)
+
+    def forward(self, state_history: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            state_history: [B, H, state_dim] - H history frames of robot state
+
+        Returns:
+            proprio_tokens: [B, H, output_dim] - encoded query tokens for VL selection
+        """
+        # Encode each frame independently
+        frame_embeds = self.frame_encoder(state_history)  # [B, H, output_dim]
+
+        # Optional: temporal attention for dynamics awareness
+        if self.use_temporal_attn:
+            attn_out, _ = self.temporal_attn(frame_embeds, frame_embeds, frame_embeds)
+            frame_embeds = self.temporal_norm(frame_embeds + attn_out)
+
+        return frame_embeds
+
+
+class ProprioGuidedVLSelector(nn.Module):
+    """Selects most relevant VL tokens using proprio history as query.
+
+    Uses cross-attention to compute relevance scores between proprio history
+    and VL tokens, then selects Top-K tokens plus an optional global residual
+    token to preserve information.
+
+    This enables efficient DiT cross-attention by reducing context from ~650
+    VL tokens to K+1 selected tokens, while using proprio state to guide
+    which visual/language features are most relevant for action prediction.
+
+    Args:
+        dim: Model dimension (dit_dim, e.g., 1024)
+        n_heads: Number of attention heads for cross-attention
+        top_k: Number of VL tokens to select
+        use_residual: If True, append a global mean-pooled token to preserve info
+        attn_dropout: Dropout probability for attention
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int = 8,
+        top_k: int = 64,
+        use_residual: bool = True,
+        attn_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.top_k = top_k
+        self.use_residual = use_residual
+
+        # Cross-attention: proprio queries attend to VL tokens
+        self.cross_attn = FlowerCrossAttention(
+            dim=dim,
+            n_heads=n_heads,
+            attn_pdrop=attn_dropout,
+            resid_pdrop=attn_dropout,
+            use_rope=False,
+        )
+
+        # Score projection: compute importance score per VL token
+        self.score_proj = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, 1),
+        )
+
+        # Global context projection for residual connection
+        if use_residual:
+            self.global_proj = nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.LayerNorm(dim),
+            )
+
+    def forward(
+        self,
+        proprio_tokens: torch.Tensor,
+        vl_tokens: torch.Tensor,
+        return_scores: bool = False,
+    ):
+        """
+        Args:
+            proprio_tokens: [B, H, dim] - encoded proprio history (queries)
+            vl_tokens: [B, N, dim] - VLM features (keys/values), N ≈ 650
+            return_scores: If True, also return attention scores for visualization
+
+        Returns:
+            selected_context: [B, K+1, dim] if use_residual else [B, K, dim]
+            (optional) scores: [B, N] softmax attention scores if return_scores=True
+        """
+        B, N, D = vl_tokens.shape
+        K = min(self.top_k, N)  # Handle edge case where N < top_k
+
+        # Step 1: Cross-attention - proprio tokens attend to all VL tokens
+        # This produces a proprio-weighted view of the VL features
+        attended = self.cross_attn(proprio_tokens, vl_tokens)  # [B, H, D]
+
+        # Step 2: Compute relevance scores for each VL token
+        # Pool proprio attention across history frames to get a summary
+        proprio_summary = attended.mean(dim=1)  # [B, D]
+
+        # Score each VL token by dot-product similarity with proprio summary
+        # This measures how relevant each VL token is to the current state
+        scores = torch.einsum('bd,bnd->bn', proprio_summary, vl_tokens)  # [B, N]
+        scores = scores / (D ** 0.5)  # Scale by sqrt(dim) for stability
+        scores_softmax = F.softmax(scores, dim=-1)
+
+        # Step 3: Top-K selection
+        # Hard selection - gradients flow through the scoring mechanism
+        _, topk_indices = scores_softmax.topk(K, dim=-1)  # [B, K]
+
+        # Gather selected tokens using indices
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)  # [B, K, D]
+        selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
+
+        # Step 4: Add global residual token to preserve information
+        if self.use_residual:
+            # Mean-pool all VL tokens and project
+            global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))  # [B, 1, D]
+            selected_context = torch.cat([selected_tokens, global_ctx], dim=1)  # [B, K+1, D]
+        else:
+            selected_context = selected_tokens  # [B, K, D]
+
+        if return_scores:
+            return selected_context, scores_softmax
+        return selected_context
+
 
 ###############################################################################
 # Encoder Classes

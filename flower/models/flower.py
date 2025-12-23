@@ -27,89 +27,15 @@ from flower.models.networks.transformers import (
     ActionSpaceEmbedderParameter,
     ZeroEncoder,
     FlowBlock,
-    stateless_norm
+    stateless_norm,
+    ProprioHistoryEncoder,
+    ProprioGuidedVLSelector,
 )
 from flower.utils.lr_schedulers.tri_stage_scheduler import TriStageLRScheduler
 from flower.callbacks.ema import EMA
 from flower.models.utils import ActionIndex, generate_policy_prompt
 
 logger = logging.getLogger(__name__)
-
-class ProprioTextTokenizer(nn.Module):
-    """Discretizes proprio state into bins and uses VLM text embeddings.
-    
-    Following RT-2/OpenVLA approach: discretize continuous values into bins
-    and reuse the last N tokens of the VLM vocabulary.
-    """
-
-    def __init__(
-        self,
-        tokenizer,
-        vlm_embeddings: nn.Module,
-        state_dim: int = 15,
-        num_bins: int = 256,
-        min_value: float = -3.0,
-        max_value: float = 3.0,
-        use_history: bool = True,
-        history_len: int = 5,
-    ):
-        """
-        Args:
-            tokenizer: VLM tokenizer (for vocab_size)
-            vlm_embeddings: VLM input embedding layer
-            state_dim: Dimension of state per frame (e.g., 15 for CALVIN)
-            num_bins: Number of discretization bins (default 256)
-            min_value: Minimum value for clipping (default -3.0 for normalized)
-            max_value: Maximum value for clipping (default 3.0 for normalized)
-            use_history: If True, tokenize full history; if False, only current state
-            history_len: Number of history frames when use_history=True
-        """
-        super().__init__()
-        self.state_dim = state_dim
-        self.num_bins = num_bins
-        self.min_value = min_value
-        self.max_value = max_value
-        self.use_history = use_history
-        self.history_len = history_len
-        
-        # Store reference to VLM embeddings (shared, not copied)
-        self.vlm_embeddings = vlm_embeddings
-        self.vocab_size = tokenizer.vocab_size
-        
-        logger.info(f"[ProprioTextTokenizer] Created: bins={num_bins}, "
-                    f"range=[{min_value}, {max_value}], vocab_size={self.vocab_size}")
-
-    def discretize(self, values: torch.Tensor) -> torch.Tensor:
-        """Convert continuous values to bin indices [0, num_bins-1]."""
-        clipped = torch.clamp(values, self.min_value, self.max_value)
-        normalized = (clipped - self.min_value) / (self.max_value - self.min_value)
-        bin_indices = (normalized * (self.num_bins - 1)).long()
-        return bin_indices
-
-    def forward(self, proprio: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            proprio: [B, state_dim] or [B, history_len, state_dim]
-        Returns:
-            tokens: [B, state_dim, vlm_dim] or [B, history_len * state_dim, vlm_dim]
-        """
-        if not self.use_history:
-            proprio = proprio.unsqueeze(1)  # [B, 1, state_dim]
-        
-        B, T, D = proprio.shape  # T = history_len or 1
-        
-        # Discretize to bin indices [0, num_bins-1]
-        bin_indices = self.discretize(proprio)  # [B, T, D]
-        
-        # Map to last num_bins tokens of vocabulary (like OpenVLA)
-        token_ids = self.vocab_size - 1 - bin_indices  # [B, T, D]
-        
-        # Get embeddings from VLM
-        embeddings = self.vlm_embeddings(token_ids)  # [B, T, D, vlm_dim]
-        
-        # Reshape to [B, T*D, vlm_dim]
-        vlm_dim = embeddings.shape[-1]
-        return embeddings.view(B, T * D, vlm_dim)
 
 
 class FLOWERVLA(pl.LightningModule):
@@ -139,15 +65,15 @@ class FLOWERVLA(pl.LightningModule):
         use_readout_token: bool = False,
         return_act_chunk: bool = False,
 
-        # Proprio-in-VLM Configuration
-        proprio_in_vlm: bool = False,
-        proprio_vlm_position: str = "append",
-        proprio_vlm_use_history: bool = False,
-        proprio_vlm_history_len: int = 5,
+        # Proprio-Guided VL Selection Configuration
+        # Uses proprio history to select the most relevant VL tokens for DiT cross-attention
+        use_proprio_vl_selection: bool = False,
+        vl_selection_k: int = 64,
+        vl_selection_use_residual: bool = True,
+        vl_selection_use_temporal_attn: bool = True,
+        vl_selection_per_layer: bool = False,
+        proprio_history_len: int = 5,
         proprio_state_dim: int = 15,
-        proprio_num_bins: int = 256,
-        proprio_min_value: float = -3.0,
-        proprio_max_value: float = 3.0,
         proprio_dropout: float = 0.0,
 
         # DiT Configuration
@@ -190,16 +116,16 @@ class FLOWERVLA(pl.LightningModule):
             token_dropout=token_dropout,
             action_type_adaln=action_type_adaln,
             sampling_type=sampling_type,
-            proprio_state_dim=proprio_state_dim,
             return_act_chunk=return_act_chunk,
             second_view_key=second_view_key,
-            proprio_in_vlm=proprio_in_vlm,
-            proprio_vlm_position=proprio_vlm_position,
-            proprio_vlm_use_history=proprio_vlm_use_history,
-            proprio_vlm_history_len=proprio_vlm_history_len,
-            proprio_num_bins=proprio_num_bins,
-            proprio_min_value=proprio_min_value,
-            proprio_max_value=proprio_max_value,
+            # Proprio-Guided VL Selection config
+            use_proprio_vl_selection=use_proprio_vl_selection,
+            vl_selection_k=vl_selection_k,
+            vl_selection_use_residual=vl_selection_use_residual,
+            vl_selection_use_temporal_attn=vl_selection_use_temporal_attn,
+            vl_selection_per_layer=vl_selection_per_layer,
+            proprio_history_len=proprio_history_len,
+            proprio_state_dim=proprio_state_dim,
             proprio_dropout=proprio_dropout,
         )
         self.obs_modalities = []
@@ -363,9 +289,6 @@ class FLOWERVLA(pl.LightningModule):
         if self.sampling_type not in ['ln', 'pi_zero', 'loglogistic', 'uniform', 'stratified']:
             raise ValueError(f"Invalid sampling type: {self.sampling_type}")
 
-        if self.proprio_vlm_position not in ["prepend", "between", "append"]:
-            raise ValueError(f"Invalid proprio_vlm_position: {self.proprio_vlm_position}. Must be prepend/between/append")
-
         self.format_instruction = functools.partial(
                              generate_policy_prompt,
                              robot_name="Franka Panda",
@@ -381,7 +304,9 @@ class FLOWERVLA(pl.LightningModule):
         self.use_nope = self.use_nope and not self.use_rope
         self.vlm_prompt_style = self.vlm_prompt_style
         self.return_act_chunk = False
-        self.proprio_dropout = self.proprio_dropout
+
+        # Initialize proprio history buffer for inference
+        self.proprio_history_buffer = None
 
     def _init_dimensions(self, **kwargs):
         """Initialize model dimensions"""
@@ -420,21 +345,11 @@ class FLOWERVLA(pl.LightningModule):
         # Setup token dropout
         self.vlm_token_dropout = nn.Dropout(self.token_dropout)
 
-        # Initialize proprio-in-VLM tokenizer if enabled
-        if self.proprio_in_vlm:
-            self.proprio_vlm_tokenizer = ProprioTextTokenizer(
-                tokenizer=self.tokenizer,
-                vlm_embeddings=self.vlm.get_input_embeddings(),
-                state_dim=self.proprio_state_dim,
-                num_bins=self.proprio_num_bins,
-                min_value=self.proprio_min_value,
-                max_value=self.proprio_max_value,
-                use_history=self.proprio_vlm_use_history,
-                history_len=self.proprio_vlm_history_len,
-            )
-            logger.info(f"[ProprioVLM] Enabled with position='{self.proprio_vlm_position}', use_history={self.proprio_vlm_use_history}")
+        # Log proprio configuration
+        if self.use_proprio_vl_selection:
+            logger.info(f"[ProprioVLSelection] Enabled with K={self.vl_selection_k}, residual={self.vl_selection_use_residual}")
         else:
-            logger.info("[ProprioVLM] Disabled (proprio_in_vlm=false)")
+            logger.info("[ProprioVLSelection] Disabled")
 
     def _setup_dit_components(self, **kwargs):
         """Setup DiT model components"""
@@ -451,6 +366,29 @@ class FLOWERVLA(pl.LightningModule):
         self.action_decoders = nn.ModuleDict()
 
         self.adaln = nn.ModuleDict() if self.action_type_adaln else None
+
+        # Proprio-Guided VL Selection modules
+        if self.use_proprio_vl_selection:
+            self.proprio_encoder = ProprioHistoryEncoder(
+                state_dim=self.proprio_state_dim,
+                output_dim=dit_dim,
+                n_heads=8,
+                dropout=self.proprio_dropout,
+                use_temporal_attn=self.vl_selection_use_temporal_attn,
+            )
+            self.vl_selector = ProprioGuidedVLSelector(
+                dim=dit_dim,
+                n_heads=8,
+                top_k=self.vl_selection_k,
+                use_residual=self.vl_selection_use_residual,
+                attn_dropout=0.1,
+            )
+            logger.info(
+                f"[ProprioVLSelection] Modules initialized: "
+                f"proprio_encoder(state_dim={self.proprio_state_dim}, output_dim={dit_dim}, "
+                f"temporal_attn={self.vl_selection_use_temporal_attn}), "
+                f"vl_selector(top_k={self.vl_selection_k}, residual={self.vl_selection_use_residual})"
+            )
 
         # Core components
         self.cond_linear = nn.Linear(hidden_dim, dit_dim, bias=False)
@@ -694,18 +632,34 @@ class FLOWERVLA(pl.LightningModule):
         t_emb = stateless_norm(self.t_embedder(t)) + \
                 stateless_norm(frequency_embeds).squeeze(1)
 
+        # Project VL features to DiT dimension
         cond = self.cond_linear(self.cond_norm(cond))
 
-        # Set up conditioning
+        # === Proprio-Guided VL Selection ===
+        if self.use_proprio_vl_selection and cond_dict.get('proprio_history') is not None:
+            proprio_history = cond_dict['proprio_history'].to(default_dtype)
+            # Encode proprio history into query tokens
+            proprio_tokens = self.proprio_encoder(proprio_history)  # [B, H, dit_dim]
+            # Select top-K VL tokens using proprio as query
+            context = self.vl_selector(proprio_tokens, cond)  # [B, K+1, dit_dim]
+
+            # Log compression ratio on first call
+            if not hasattr(self, '_vl_selection_forward_logged'):
+                logger.info(
+                    f"[ProprioVLSelection] VL tokens: {cond.shape[1]} -> Selected: {context.shape[1]} "
+                    f"(compression: {cond.shape[1] / context.shape[1]:.1f}x)"
+                )
+                self._vl_selection_forward_logged = True
+        else:
+            # Default: use all VL tokens
+            context = cond if self.use_cross_attn else None
+
+        # Set up global conditioning
         if self.use_adaln_cond:
             vlm_token = cond[:, 0, :] if self.use_readout_token else cond.mean(dim=1)
             global_cond = vlm_token + t_emb
         else:
             global_cond = t_emb
-
-        # Setup context
-        cx = z
-        context = cond if self.use_cross_attn else None
 
         # Get adaln signals
         if not self.action_type_adaln:
@@ -713,8 +667,8 @@ class FLOWERVLA(pl.LightningModule):
         else:
             global_adaln = self.action_specific_adaln(global_cond, action_type)
 
-
         # Process through DiT blocks
+        cx = z
         for layer in self.dit:
             cx = layer(
                 cx,
@@ -795,85 +749,19 @@ class FLOWERVLA(pl.LightningModule):
             image2_features = image2_features.view(B, 1 * image2_features.shape[1], -1)
             image_features = torch.cat([image_features, image2_features], dim=1)
 
-        # Get proprio tokens for VLM injection if enabled
-        proprio_vlm_tokens = None
-        if self.proprio_in_vlm and 'robot_obs' in batch:
-            robot_obs = batch['robot_obs'].to(device).to(default_type)
-            if self.proprio_vlm_use_history:
-                # Use full history: [B, history_len, state_dim]
-                proprio_vlm_tokens = self.proprio_vlm_tokenizer(robot_obs)
-                if not hasattr(self, '_proprio_vlm_input_logged'):
-                    logger.info(f"[ProprioVLM] Using history mode: robot_obs shape: {robot_obs.shape}")
-                    self._proprio_vlm_input_logged = True
-            else:
-                # Use only current state: [B, state_dim]
-                current_state = robot_obs[:, -1, :]
-                proprio_vlm_tokens = self.proprio_vlm_tokenizer(current_state)
-                if not hasattr(self, '_proprio_vlm_input_logged'):
-                    logger.info(f"[ProprioVLM] Using current state mode: current_state shape: {current_state.shape}")
-                    self._proprio_vlm_input_logged = True
-
-            # Apply per-frame dropout to proprioceptive tokens if training
-            # Each frame (state_dim tokens) is dropped together to maintain spatial coherence
-            if self.training and self.proprio_dropout > 0.0:
-                # Determine number of frames
-                T = robot_obs.shape[1] if self.proprio_vlm_use_history else 1
-                # Create per-frame mask: [B, T, 1]
-                frame_mask = torch.bernoulli(
-                    torch.ones(B, T, 1, device=device) * (1 - self.proprio_dropout)
-                )
-                # Expand to cover all dims per frame: [B, T, state_dim] -> [B, T*state_dim]
-                frame_mask = frame_mask.expand(-1, -1, self.proprio_state_dim).reshape(B, -1)
-                # Apply to tokens: [B, T*state_dim, vlm_dim] * [B, T*state_dim, 1]
-                proprio_vlm_tokens = proprio_vlm_tokens * frame_mask.unsqueeze(-1)
-
         # Get text embeddings
-        # Get text embeddings once to reuse
         constructed_prompts = self.construct_prompts(batch)
         text_embeds = self._get_text_embeddings(constructed_prompts, device)
 
         # Add task prompt and aggregation tokens
         task_prompt = self.prompt_embeds.expand(B, -1, -1).to(image_features.device)
 
-        # Merge sequence with optional proprio tokens
-        if proprio_vlm_tokens is not None:
-            if self.proprio_vlm_position == "prepend":
-                # proprio before vision
-                merged_embeds = torch.cat([
-                    proprio_vlm_tokens,
-                    image_features,
-                    task_prompt,
-                    text_embeds.to(image_features.device)
-                ], dim=1)
-            elif self.proprio_vlm_position == "between":
-                # proprio between vision and text
-                merged_embeds = torch.cat([
-                    image_features,
-                    proprio_vlm_tokens,
-                    task_prompt,
-                    text_embeds.to(image_features.device)
-                ], dim=1)
-            else:  # "append" (default)
-                # proprio after text
-                merged_embeds = torch.cat([
-                    image_features,
-                    task_prompt,
-                    text_embeds.to(image_features.device),
-                    proprio_vlm_tokens,
-                ], dim=1)
-            # Log shape on first call
-            if not hasattr(self, '_proprio_vlm_logged'):
-                logger.info(f"[ProprioVLM] Position: '{self.proprio_vlm_position}'")
-                logger.info(f"[ProprioVLM] Component shapes - image: {image_features.shape[1]}, task: {task_prompt.shape[1]}, text: {text_embeds.shape[1]}, proprio: {proprio_vlm_tokens.shape[1]}")
-                logger.info(f"[ProprioVLM] Proprio tokens shape: {proprio_vlm_tokens.shape}, merged shape: {merged_embeds.shape}")
-                self._proprio_vlm_logged = True
-        else:
-            # Original behavior without proprio
-            merged_embeds = torch.cat([
-                image_features,
-                task_prompt,
-                text_embeds.to(image_features.device)
-            ], dim=1)
+        # Merge sequence: [image_features, task_prompt, text_embeds]
+        merged_embeds = torch.cat([
+            image_features,
+            task_prompt,
+            text_embeds.to(image_features.device)
+        ], dim=1)
 
         # Create attention mask
         attention_mask = torch.ones(merged_embeds.shape[:2], device=merged_embeds.device)
@@ -892,12 +780,21 @@ class FLOWERVLA(pl.LightningModule):
             torch.ones_like(embed_tensor).to(device) * 3
         )
 
+        # Get proprio history for VL selection if enabled
+        proprio_history = None
+        if self.use_proprio_vl_selection and 'robot_obs' in batch:
+            proprio_history = batch['robot_obs'].to(device).to(default_type)  # [B, history_len, state_dim]
+            if not hasattr(self, '_proprio_vl_selection_logged'):
+                logger.info(f"[ProprioVLSelection] proprio_history shape: {proprio_history.shape}")
+                self._proprio_vl_selection_logged = True
+
         return {
             'features': features,
             'frequency_embeds': frequency_embeds,
             'action_space_embeds': None,
-            'action_type': torch.ones_like(action_type_tensor), # action type is always 1
+            'action_type': torch.ones_like(action_type_tensor),  # action type is always 1
             'attention_mask': attention_mask,
+            'proprio_history': proprio_history,  # For VL selection
         }
 
     def encode_actions(self, z: torch.Tensor, action_type: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -958,8 +855,8 @@ class FLOWERVLA(pl.LightningModule):
             },
             "lang_text": [goal["lang_text"]]
         }
-        # Add robot_obs for proprio history encoding if available
-        if self.proprio_vlm_use_history and "robot_obs" in obs:
+        # Add robot_obs for proprio history encoding if VL selection is enabled
+        if self.use_proprio_vl_selection and "robot_obs" in obs:
             robot_obs = obs["robot_obs"]
             # Wrapper provides [B, state_dim], we need [B, history_len, state_dim]
             if robot_obs.dim() == 2:
@@ -971,9 +868,12 @@ class FLOWERVLA(pl.LightningModule):
                 if self.proprio_history_buffer is None:
                     # First step: initialize buffer with zeros (more stable than repeating first obs)
                     self.proprio_history_buffer = torch.zeros(
-                        robot_obs.shape[0], self.proprio_vlm_history_len, robot_obs.shape[-1],
+                        robot_obs.shape[0], self.proprio_history_len, robot_obs.shape[-1],
                         device=robot_obs.device, dtype=robot_obs.dtype
                     )
+                    if not hasattr(self, '_proprio_buffer_logged'):
+                        logger.info(f"[ProprioBuffer] Initialized buffer shape: {self.proprio_history_buffer.shape}")
+                        self._proprio_buffer_logged = True
                 # Shift buffer: remove oldest, append newest (FIFO)
                 self.proprio_history_buffer = torch.cat([
                     self.proprio_history_buffer[:, 1:, :],  # Keep last (history_len-1) frames
@@ -1035,6 +935,9 @@ class FLOWERVLA(pl.LightningModule):
         """Full reset for new evaluation sequence."""
         self.reset()
         self.proprio_history_buffer = None
+        # Reset log flags for new sequence
+        if hasattr(self, '_proprio_buffer_logged'):
+            delattr(self, '_proprio_buffer_logged')
 
     def on_train_start(self):
         """Convert model to appropriate dtype on training start."""

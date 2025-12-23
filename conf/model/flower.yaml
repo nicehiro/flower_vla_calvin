@@ -31,17 +31,21 @@ use_adaln_cond: false
 use_readout_token: false
 return_act_chunk: false
 
-# Proprioception in VLM (inject proprio into vision-language encoder)
-# Uses text tokenization: discretizes proprio values into bins and uses VLM embeddings
-proprio_in_vlm: true              # Enable proprio injection into VLM
-proprio_vlm_position: "append"    # prepend | between | append (relative to text)
-proprio_vlm_use_history: true     # Use full history or just current state
-proprio_vlm_history_len: 5        # Number of history frames for VLM tokenizer
+# ==============================================================================
+# Proprio-Guided VL Token Selection
+# Uses proprio history to select the most relevant VL tokens via cross-attention,
+# then uses only selected tokens as context for DiT cross-attention (compression)
+# ==============================================================================
+use_proprio_vl_selection: true    # Enable proprio-guided VL token selection
+vl_selection_k: 64                # Top-K VL tokens to keep (out of ~650)
+vl_selection_use_residual: true   # Add global mean-pooled token to preserve info
+vl_selection_use_temporal_attn: true  # Use temporal self-attention in proprio encoder
+vl_selection_per_layer: false     # If True, select per DiT layer (future extension)
+
+# Proprio configuration
+proprio_history_len: 5            # Number of history frames (1 = current state only)
 proprio_state_dim: 15             # State dimension per frame (CALVIN robot_obs is 15D)
-proprio_num_bins: 256             # Number of discretization bins (like RT-2/OpenVLA)
-proprio_min_value: -3.0           # Min value for normalized proprio (clips to this)
-proprio_max_value: 3.0            # Max value for normalized proprio (clips to this)
-proprio_dropout: 0.5              # Per-frame dropout probability during training
+proprio_dropout: 0.0              # Dropout probability in proprio encoder
 
 # DiT Configuration
 sampling_type: uniform
