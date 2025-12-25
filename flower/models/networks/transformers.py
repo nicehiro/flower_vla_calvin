@@ -513,7 +513,7 @@ class ProprioGuidedVLSelector(nn.Module):
         mode: Selection mode (see above)
     """
 
-    VALID_MODES = ["proprio_topk", "random", "mean_pool", "max_pool", "soft_topk_ste", "soft_topk_gumbel"]
+    VALID_MODES = ["proprio_topk", "random", "mean_pool", "max_pool", "soft_topk_ste", "soft_topk_gumbel", "proprio_weighted_mean"]
 
     def __init__(
         self,
@@ -536,7 +536,7 @@ class ProprioGuidedVLSelector(nn.Module):
 
         # Cross-attention: proprio queries attend to VL tokens
         # Only needed for proprio-based modes
-        if mode in ["proprio_topk", "soft_topk_ste", "soft_topk_gumbel"]:
+        if mode in ["proprio_topk", "soft_topk_ste", "soft_topk_gumbel", "proprio_weighted_mean"]:
             self.cross_attn = FlowerCrossAttention(
                 dim=dim,
                 n_heads=n_heads,
@@ -585,6 +585,8 @@ class ProprioGuidedVLSelector(nn.Module):
             return self._soft_topk_ste(proprio_tokens, vl_tokens, K, return_scores)
         elif self.mode == "soft_topk_gumbel":
             return self._soft_topk_gumbel(proprio_tokens, vl_tokens, K, return_scores)
+        elif self.mode == "proprio_weighted_mean":
+            return self._proprio_weighted_mean(proprio_tokens, vl_tokens, return_scores)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -646,6 +648,41 @@ class ProprioGuidedVLSelector(nn.Module):
             uniform_scores = torch.ones(B, N, device=vl_tokens.device) / N
             return pooled, uniform_scores
         return pooled
+
+    def _proprio_weighted_mean(self, proprio_tokens, vl_tokens, return_scores):
+        """Proprio-guided weighted mean - quality over quantity.
+        
+        Instead of hard top-K selection, compute attention-weighted mean of all
+        VL tokens using proprio-guided relevance scores. Outputs a single token
+        that captures proprio-relevant information from the entire VL context.
+        
+        Args:
+            proprio_tokens: [B, H, D] - encoded proprio history
+            vl_tokens: [B, N, D] - VL features
+            return_scores: If True, also return attention weights
+            
+        Returns:
+            weighted_mean: [B, 1, D] - single proprio-guided context token
+            (optional) attn_weights: [B, N] - attention weights over VL tokens
+        """
+        B, N, D = vl_tokens.shape
+
+        # Cross-attention: proprio tokens attend to all VL tokens
+        attended = self.cross_attn(proprio_tokens, vl_tokens)  # [B, H, D]
+
+        # Compute relevance scores
+        proprio_summary = attended.mean(dim=1)  # [B, D]
+        scores = torch.einsum('bd,bnd->bn', proprio_summary, vl_tokens)  # [B, N]
+        scores = scores / (D ** 0.5)
+        attn_weights = F.softmax(scores, dim=-1)  # [B, N]
+
+        # Weighted mean instead of hard selection
+        weighted_mean = torch.einsum('bn,bnd->bd', attn_weights, vl_tokens)  # [B, D]
+        weighted_mean = weighted_mean.unsqueeze(1)  # [B, 1, D]
+
+        if return_scores:
+            return weighted_mean, attn_weights
+        return weighted_mean
 
     def _max_pool(self, vl_tokens, K, return_scores):
         """Select top-K tokens based on max feature values (L-inf norm as score)."""
