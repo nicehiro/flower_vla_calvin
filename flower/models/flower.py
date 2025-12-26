@@ -372,7 +372,11 @@ class FLOWERVLA(pl.LightningModule):
         # Proprio-Guided VL Selection modules
         if self.use_proprio_vl_selection:
             # Modes that require proprio encoding
-            proprio_based_modes = ["proprio_topk", "soft_topk_ste", "soft_topk_gumbel"]
+            proprio_based_modes = [
+                "proprio_topk", "soft_topk_ste", "soft_topk_gumbel",
+                "max_pool_proprio_ctx",   # Config A: needs proprio tokens as context
+                "proprio_max_hybrid",     # Config B: needs proprio for scoring + injection
+            ]
             
             # Only create proprio_encoder for modes that need it
             if self.vl_selection_mode in proprio_based_modes:

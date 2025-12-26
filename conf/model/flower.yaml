@@ -48,6 +48,8 @@ vl_selection_per_layer: false     # If True, select per DiT layer (future extens
 #   - max_pool: Select top-K tokens based on max feature values
 #   - soft_topk_ste: Straight-Through Estimator for differentiable selection
 #   - soft_topk_gumbel: Gumbel-Softmax for differentiable selection
+#   - max_pool_proprio_ctx: Max selection + proprio as separate context tokens [B, K+H+1, D]
+#   - proprio_max_hybrid: Hybrid max+proprio scoring + gated proprio injection [B, K+1, D]
 vl_selection_mode: "proprio_topk"
 
 # Proprio configuration

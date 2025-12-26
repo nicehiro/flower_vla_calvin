@@ -513,7 +513,12 @@ class ProprioGuidedVLSelector(nn.Module):
         mode: Selection mode (see above)
     """
 
-    VALID_MODES = ["proprio_topk", "random", "mean_pool", "max_pool", "soft_topk_ste", "soft_topk_gumbel", "proprio_weighted_mean"]
+    VALID_MODES = [
+        "proprio_topk", "random", "mean_pool", "max_pool", 
+        "soft_topk_ste", "soft_topk_gumbel", "proprio_weighted_mean",
+        "max_pool_proprio_ctx",   # Config A: max selection + proprio as context tokens
+        "proprio_max_hybrid",     # Config B: hybrid max+proprio scoring + gated injection
+    ]
 
     def __init__(
         self,
@@ -536,7 +541,7 @@ class ProprioGuidedVLSelector(nn.Module):
 
         # Cross-attention: proprio queries attend to VL tokens
         # Only needed for proprio-based modes
-        if mode in ["proprio_topk", "soft_topk_ste", "soft_topk_gumbel", "proprio_weighted_mean"]:
+        if mode in ["proprio_topk", "soft_topk_ste", "soft_topk_gumbel", "proprio_weighted_mean", "proprio_max_hybrid"]:
             self.cross_attn = FlowerCrossAttention(
                 dim=dim,
                 n_heads=n_heads,
@@ -546,12 +551,30 @@ class ProprioGuidedVLSelector(nn.Module):
             )
 
         # Global context projection for residual connection
-        # Used by proprio_topk, max_pool, soft_topk_ste, soft_topk_gumbel
+        # Used by proprio_topk, max_pool, soft_topk_ste, soft_topk_gumbel, and new modes
         if use_residual and mode not in ["mean_pool", "random"]:
             self.global_proj = nn.Sequential(
                 nn.Linear(dim, dim),
                 nn.LayerNorm(dim),
             )
+
+        # Config A: max_pool_proprio_ctx - alignment layer to project proprio to VL space
+        if mode == "max_pool_proprio_ctx":
+            self.proprio_to_vl_proj = nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.LayerNorm(dim),
+            )
+
+        # Config B: proprio_max_hybrid - additional layers for gated injection and score combination
+        if mode == "proprio_max_hybrid":
+            # Gated addition for proprio injection into selected VL tokens
+            self.proprio_gate = nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.Sigmoid(),
+            )
+            # Learnable weight for combining max and proprio scores
+            # sigmoid(0.0) = 0.5, giving equal initial weight to both
+            self.score_alpha = nn.Parameter(torch.tensor(0.0))
 
     def forward(
         self,
@@ -587,6 +610,10 @@ class ProprioGuidedVLSelector(nn.Module):
             return self._soft_topk_gumbel(proprio_tokens, vl_tokens, K, return_scores)
         elif self.mode == "proprio_weighted_mean":
             return self._proprio_weighted_mean(proprio_tokens, vl_tokens, return_scores)
+        elif self.mode == "max_pool_proprio_ctx":
+            return self._max_pool_proprio_ctx(proprio_tokens, vl_tokens, K, return_scores)
+        elif self.mode == "proprio_max_hybrid":
+            return self._proprio_max_hybrid(proprio_tokens, vl_tokens, K, return_scores)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -789,6 +816,93 @@ class ProprioGuidedVLSelector(nn.Module):
 
         if return_scores:
             return selected_context, soft_weights
+        return selected_context
+
+    def _max_pool_proprio_ctx(self, proprio_tokens, vl_tokens, K, return_scores):
+        """
+        Config A: Max-pool selection + proprio as separate context tokens.
+        
+        - Uses L-inf norm for VL token selection (proven effective)
+        - Projects proprio tokens to VL space for better alignment
+        - Adds global residual for completeness
+        
+        Output: [B, K + H + 1, D] where H is proprio history length
+        """
+        B, N, D = vl_tokens.shape
+        H = proprio_tokens.shape[1]  # proprio history length
+        
+        # === Step 1: Max-pool selection (same as _max_pool) ===
+        scores = vl_tokens.abs().max(dim=-1)[0]  # [B, N]
+        scores_softmax = F.softmax(scores, dim=-1)
+        
+        _, topk_indices = scores.topk(K, dim=-1)  # [B, K]
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
+        selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
+        
+        # === Step 2: Project proprio tokens to VL space for alignment ===
+        # proprio_tokens: [B, H, D] - encoded by ProprioHistoryEncoder
+        # Project to align with VL feature distribution
+        proprio_aligned = self.proprio_to_vl_proj(proprio_tokens)  # [B, H, D]
+        
+        # === Step 3: Add global residual ===
+        if self.use_residual:
+            global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))  # [B, 1, D]
+            # Concatenate: [selected_vl, proprio_aligned, global_residual]
+            selected_context = torch.cat([selected_tokens, proprio_aligned, global_ctx], dim=1)  # [B, K+H+1, D]
+        else:
+            selected_context = torch.cat([selected_tokens, proprio_aligned], dim=1)  # [B, K+H, D]
+        
+        if return_scores:
+            return selected_context, scores_softmax
+        return selected_context
+
+    def _proprio_max_hybrid(self, proprio_tokens, vl_tokens, K, return_scores):
+        """
+        Config B: Hybrid scoring (max + proprio) + gated proprio injection.
+        
+        - Combines L-inf norm scores with proprio-guided attention scores
+        - Uses gated addition to inject proprio info into selected features
+        - Learnable alpha balances the two scoring methods
+        
+        Output: [B, K + 1, D]
+        """
+        B, N, D = vl_tokens.shape
+        
+        # === Step 1: Compute max-pool scores (L-inf norm) ===
+        max_scores = vl_tokens.abs().max(dim=-1)[0]  # [B, N]
+        # Normalize to [0, 1] range for fair combination
+        max_scores_norm = max_scores / (max_scores.max(dim=-1, keepdim=True)[0] + 1e-8)
+        
+        # === Step 2: Compute proprio-guided scores ===
+        attended = self.cross_attn(proprio_tokens, vl_tokens)  # [B, H, D]
+        proprio_summary = attended.mean(dim=1)  # [B, D]
+        proprio_scores = torch.einsum('bd,bnd->bn', proprio_summary, vl_tokens)  # [B, N]
+        proprio_scores = proprio_scores / (D ** 0.5)
+        proprio_scores_norm = F.softmax(proprio_scores, dim=-1)  # [B, N]
+        
+        # === Step 3: Combine scores with learnable alpha ===
+        alpha = self.score_alpha.sigmoid()  # constrain to [0, 1]
+        combined_scores = (1 - alpha) * max_scores_norm + alpha * proprio_scores_norm
+        
+        # === Step 4: Top-K selection based on combined scores ===
+        _, topk_indices = combined_scores.topk(K, dim=-1)  # [B, K]
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
+        selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
+        
+        # === Step 5: Gated proprio injection ===
+        proprio_broadcast = proprio_summary.unsqueeze(1).expand(-1, K, -1)  # [B, K, D]
+        gate = self.proprio_gate(proprio_broadcast)  # [B, K, D], values in [0, 1]
+        fused = selected_tokens + gate * proprio_broadcast  # gated addition
+        
+        # === Step 6: Add global residual ===
+        if self.use_residual:
+            global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))  # [B, 1, D]
+            selected_context = torch.cat([fused, global_ctx], dim=1)  # [B, K+1, D]
+        else:
+            selected_context = fused
+        
+        if return_scores:
+            return selected_context, combined_scores
         return selected_context
 
 
