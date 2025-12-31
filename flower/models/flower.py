@@ -990,11 +990,8 @@ class FLOWERVLA(pl.LightningModule):
             if self.trainer.max_steps and self.trainer.max_steps > 0:
                 progress = self.global_step / self.trainer.max_steps
             elif self.trainer.max_epochs and self.trainer.max_epochs > 0:
-                # Estimate based on epochs if max_steps not set
-                try:
-                    steps_per_epoch = len(self.trainer.train_dataloader)
-                except (TypeError, AttributeError):
-                    steps_per_epoch = 1000  # Fallback estimate
+                # Use num_training_batches which respects limit_train_batches
+                steps_per_epoch = self.trainer.num_training_batches
                 total_steps = self.trainer.max_epochs * steps_per_epoch
                 progress = self.global_step / max(total_steps, 1)
             else:
