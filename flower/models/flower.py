@@ -197,6 +197,7 @@ class FLOWERVLA(pl.LightningModule):
         self.rollout_step_counter = 0
         self.pred_action_seq = None
         self.modality_scope = "lang"
+        self.proprio_history_buffer = None  # Rolling buffer for inference
         # Save optimizer config
         self.optimizer_config = optimizer
         self.lr_scheduler_config = lr_scheduler
