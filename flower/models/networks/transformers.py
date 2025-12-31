@@ -39,7 +39,7 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
 class SwiGlu(nn.Module):
     """
     An implementation of the SwiGlu MLP activation as used in transformer feedforward layers.
-    
+
     Args:
         dim: Input dimension.
         hidden_dim: Dimension of the hidden layer. If None, defaults to 4 * dim.
@@ -99,13 +99,13 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
                          position_ids: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies rotary positional embeddings to queries and keys.
-    
+
     Args:
         q: Query tensor of shape [B, heads, seq_len, head_dim].
         k: Key tensor with the same shape as q.
         cos, sin: Cosine and sine frequency tensors of shape [max_seq_len, head_dim/2].
         position_ids: Optional tensor with position indices; if None, uses sequential positions.
-    
+
     Returns:
         A tuple (q_rot, k_rot) with rotary embeddings applied.
     """
@@ -127,7 +127,7 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
 class FlowerAttention(nn.Module):
     """
     Multi-head self-attention module with optional rotary positional embeddings.
-    
+
     Args:
         dim: Input dimension.
         n_heads: Number of attention heads.
@@ -170,12 +170,12 @@ class FlowerAttention(nn.Module):
                 is_causal: bool = False) -> torch.Tensor:
         """
         Forward pass for self-attention.
-        
+
         Args:
             x: Input tensor of shape [B, seq_len, dim].
             custom_attn_mask: Optional attention mask.
             is_causal: If True, applies causal masking.
-        
+
         Returns:
             Tensor of shape [B, seq_len, dim] after attention and projection.
         """
@@ -206,12 +206,12 @@ class FlowerAttention(nn.Module):
         out = attn_output.transpose(1, 2).reshape(B, T, C)
         out = self.resid_dropout(self.proj(out))
         return out
-    
+
 
 class FlowerCrossAttention(nn.Module):
     """
     Cross-attention module with optional rotary embeddings.
-    
+
     Args:
         dim: Input and output dimension.
         n_heads: Number of attention heads.
@@ -264,12 +264,12 @@ class FlowerCrossAttention(nn.Module):
                 custom_attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Applies cross-attention between x (queries) and context (keys and values).
-        
+
         Args:
             x: Query tensor of shape [B, seq_len, dim].
             context: Context tensor of shape [B, context_len, dim].
             custom_attn_mask: Optional attention mask.
-        
+
         Returns:
             Tensor of shape [B, seq_len, dim].
         """
@@ -313,7 +313,7 @@ class FlowBlock(nn.Module):
     """
     A transformer block for flow-based diffusion. Combines self-attention,
     (optional) cross-attention, and a SwiGlu MLP with adaptive layer normalization modulation.
-    
+
     Args:
         dim: Input dimension.
         heads: Number of attention heads.
@@ -370,7 +370,7 @@ class FlowBlock(nn.Module):
                 global_adaln: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
         """
         Forward pass through the FlowBlock.
-        
+
         Args:
             cx: Input tensor for the block (e.g. action latent representations) of shape [B, L, D].
             c: Conditioning tensor (from external encoder).
@@ -378,7 +378,7 @@ class FlowBlock(nn.Module):
             custom_attn_mask: Optional attention mask.
             is_causal: If True, uses causal self-attention.
             global_adaln: Optional list of global AdaLN modulation signals.
-        
+
         Returns:
             Output tensor of shape [B, L, D].
         """
@@ -514,7 +514,7 @@ class ProprioGuidedVLSelector(nn.Module):
     """
 
     VALID_MODES = [
-        "proprio_topk", "random", "mean_pool", "max_pool", 
+        "proprio_topk", "random", "mean_pool", "max_pool",
         "soft_topk_ste", "soft_topk_gumbel", "proprio_weighted_mean",
         "max_pool_proprio_ctx",   # Config A: max selection + proprio as context tokens
         "proprio_max_hybrid",     # Config B: hybrid max+proprio scoring + gated injection
@@ -575,6 +575,72 @@ class ProprioGuidedVLSelector(nn.Module):
             # Learnable weight for combining max and proprio scores
             # sigmoid(0.0) = 0.5, giving equal initial weight to both
             self.score_alpha = nn.Parameter(torch.tensor(0.0))
+
+        # LightVLA-style noise schedule parameters for soft_topk_gumbel mode
+        if mode == "soft_topk_gumbel":
+            # Noise schedule: high exploration initially, near-deterministic at end
+            self.gumbel_noise_start = 1.0
+            self.gumbel_noise_end = 0.01
+            self.gumbel_temperature = 1.0
+            self.min_tokens = max(1, top_k // 4)  # Minimum unique tokens to keep
+            self.register_buffer('_training_progress', torch.tensor(0.0))
+
+    def set_training_progress(self, progress: float):
+        """
+        Update training progress for noise schedule (LightVLA-style).
+        Call from training loop: selector.set_training_progress(global_step / max_steps)
+
+        Args:
+            progress: float in [0, 1], where 0 = start, 1 = end of training
+        """
+        if hasattr(self, '_training_progress'):
+            self._training_progress.fill_(min(1.0, max(0.0, progress)))
+
+    @property
+    def current_noise_scale(self) -> float:
+        """
+        Cosine annealing from noise_start to noise_end.
+
+        LightVLA insight: High noise early encourages exploration of different
+        token selections. Low noise late stabilizes to optimal selection.
+        """
+        if not hasattr(self, '_training_progress'):
+            return 0.0  # No noise for non-gumbel modes
+        progress = self._training_progress.item()
+        # Cosine annealing: starts at noise_start, ends at noise_end
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        return self.gumbel_noise_end + (self.gumbel_noise_start - self.gumbel_noise_end) * cosine_decay
+
+    def _generate_per_token_queries(self, proprio_tokens: torch.Tensor, vl_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Generate N queries (one per VL token) via proprio-VL cross-attention.
+
+        LightVLA-style: Q = softmax(H_v @ H_l^T / sqrt(D)) @ H_l
+        Adapted for proprio: Q = softmax(vl_tokens @ proprio_tokens^T / sqrt(D)) @ proprio_tokens
+
+        Each query Q[i] represents "what proprio information is relevant for VL position i".
+        This allows each VL token to have a personalized query based on its content
+        and the current robot state, enabling position-aware token selection.
+
+        Args:
+            proprio_tokens: [B, H, D] - encoded proprio history (H frames)
+            vl_tokens: [B, N, D] - VL features (N tokens)
+
+        Returns:
+            queries: [B, N, D] - one query per VL token position
+        """
+        B, N, D = vl_tokens.shape
+
+        # Cross-attention weights: each VL token attends to proprio history
+        # [B, N, D] @ [B, D, H] -> [B, N, H]
+        attn_logits = torch.einsum('bnd,bhd->bnh', vl_tokens, proprio_tokens) / (D ** 0.5)
+        attn_weights = F.softmax(attn_logits, dim=-1)  # [B, N, H]
+
+        # Generate queries: weighted sum of proprio tokens for each VL position
+        # [B, N, H] @ [B, H, D] -> [B, N, D]
+        queries = torch.einsum('bnh,bhd->bnd', attn_weights, proprio_tokens)
+
+        return queries
 
     def forward(
         self,
@@ -678,16 +744,16 @@ class ProprioGuidedVLSelector(nn.Module):
 
     def _proprio_weighted_mean(self, proprio_tokens, vl_tokens, return_scores):
         """Proprio-guided weighted mean - quality over quantity.
-        
+
         Instead of hard top-K selection, compute attention-weighted mean of all
         VL tokens using proprio-guided relevance scores. Outputs a single token
         that captures proprio-relevant information from the entire VL context.
-        
+
         Args:
             proprio_tokens: [B, H, D] - encoded proprio history
             vl_tokens: [B, N, D] - VL features
             return_scores: If True, also return attention weights
-            
+
         Returns:
             weighted_mean: [B, 1, D] - single proprio-guided context token
             (optional) attn_weights: [B, N] - attention weights over VL tokens
@@ -736,7 +802,19 @@ class ProprioGuidedVLSelector(nn.Module):
         return selected_context
 
     def _soft_topk_ste(self, proprio_tokens, vl_tokens, K, return_scores):
-        """Straight-Through Estimator: hard forward, soft backward."""
+        """Straight-Through Estimator: hard forward, soft backward.
+
+        Proper STE implementation:
+        - Forward: hard top-K selection (unscaled tokens)
+        - Backward: gradients flow through soft attention weights to ALL N tokens
+
+        The key insight: we need gradients to flow to all N token scores, not just
+        the K selected ones. This allows the model to learn which tokens SHOULD
+        have been selected (increase their scores) vs which shouldn't (decrease).
+
+        We achieve this by computing a soft weighted sum over ALL tokens for the
+        backward pass, while using hard top-K selection for the forward pass.
+        """
         B, N, D = vl_tokens.shape
 
         # Compute scores (same as proprio_topk)
@@ -746,18 +824,30 @@ class ProprioGuidedVLSelector(nn.Module):
         scores = scores / (D ** 0.5)
         scores_softmax = F.softmax(scores, dim=-1)  # [B, N]
 
-        # Hard top-K selection (forward pass)
-        _, topk_indices = scores_softmax.topk(K, dim=-1)
-        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
-        selected_hard = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
+        if self.training:
+            temperature = 1.0
+            mask_value = torch.finfo(scores.dtype).min
+            logits = scores  # [B, N]
 
-        # STE: Create soft gradient path
-        # Compute weighted sum of ALL tokens for gradient flow
-        soft_weighted = torch.einsum('bn,bnd->bd', scores_softmax, vl_tokens)  # [B, D]
+            selected = []
+            logits_work = logits
+            for _ in range(K):
+                probs_soft = F.softmax(logits_work / temperature, dim=-1)  # [B, N]
+                idx = probs_soft.argmax(dim=-1)  # [B]
+                onehot = F.one_hot(idx, num_classes=N).type_as(probs_soft)  # [B, N]
+                st_probs = onehot + (probs_soft - probs_soft.detach())  # [B, N]
 
-        # Straight-through trick: forward uses hard selection, backward uses soft gradient
-        # Add zero-valued term that creates gradient path: (soft - soft.detach()) = 0 in forward
-        selected_tokens = selected_hard + (soft_weighted.unsqueeze(1) - soft_weighted.unsqueeze(1).detach())
+                token = torch.einsum("bn,bnd->bd", st_probs, vl_tokens)  # [B, D]
+                selected.append(token)
+
+                logits_work = logits_work.masked_fill(onehot.bool(), mask_value)
+
+            selected_tokens = torch.stack(selected, dim=1)  # [B, K, D]
+        else:
+            # Inference: standard hard top-K selection
+            _, topk_indices = scores_softmax.topk(K, dim=-1)  # [B, K]
+            topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
+            selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
 
         # Add residual
         if self.use_residual:
@@ -771,79 +861,153 @@ class ProprioGuidedVLSelector(nn.Module):
         return selected_context
 
     def _soft_topk_gumbel(self, proprio_tokens, vl_tokens, K, return_scores):
-        """Gumbel-Softmax for differentiable selection."""
-        B, N, D = vl_tokens.shape
-        temperature = 1.0  # Fixed temperature
+        """
+        Proprioceptive Token Selection with Gumbel-Softmax (Algorithm 1).
 
-        # Compute scores
-        attended = self.cross_attn(proprio_tokens, vl_tokens)
-        proprio_summary = attended.mean(dim=1)
-        scores = torch.einsum('bd,bnd->bn', proprio_summary, vl_tokens)
-        scores = scores / (D ** 0.5)
+        This implements the differentiable token selection mechanism inspired by LightVLA,
+        adapted for proprioceptive-guided selection of fused vision-language tokens.
 
-        # Add Gumbel noise during training for exploration
+        Algorithm:
+            Step 0: P ← MLP(p)                           # Done in ProprioHistoryEncoder
+            Step 1: Q ← softmax(H_fused · P^T / √D) · P  # Query Generation
+            Step 2: S ← Q · H_fused^T / √D               # Token Scoring
+            Step 3: Gumbel-Softmax with ε ~ U(0, α)      # Differentiable Selection
+            Step 4: H'_fused ← I · H_fused               # Token Selection
+
+        Key insight: Each of the L queries selects one token. When multiple queries
+        select the same token, the effective token count is reduced adaptively.
+        The noise schedule (α decays during training) enables exploration early
+        and exploitation late.
+
+        Args:
+            proprio_tokens: [B, T, D] - Projected proprio states P (T timesteps)
+            vl_tokens: [B, L, D] - Fused vision-language tokens H_fused
+            K: Maximum number of tokens (used for inference deduplication)
+            return_scores: Whether to return attention scores
+
+        Returns:
+            selected_tokens: [B, L, D] (training) or [B, K', D] (inference, K' ≤ K unique)
+        """
+        B, L, D = vl_tokens.shape  # L = number of fused tokens
+
+        # === Step 1: Query Generation ===
+        # Q ← softmax(H_fused · P^T / √D) · P
+        # Each fused token generates a query by attending to proprio history
+        queries = self._generate_per_token_queries(proprio_tokens, vl_tokens)  # [B, L, D]
+
+        # === Step 2: Token Scoring ===
+        # S ← Q · H_fused^T / √D
+        # Each query scores all fused tokens
+        scores = torch.einsum('bqd,bkd->bqk', queries, vl_tokens) / (D ** 0.5)  # [B, L, L]
+
         if self.training:
-            # Gumbel(0, 1) = -log(-log(U)), U ~ Uniform(0, 1)
-            gumbel_noise = -torch.log(-torch.log(torch.rand_like(scores) + 1e-8) + 1e-8)
-            perturbed_scores = (scores + gumbel_noise) / temperature
+            # === Step 3: Gumbel-Softmax Selection ===
+            # ε ~ U(0, α) where α decays during training
+            noise_scale = self.current_noise_scale
+            noise = torch.rand_like(scores) * noise_scale  # ε ~ U(0, α)
+            noisy_scores = scores + noise  # S' ← S + ε
+
+            # S_soft ← softmax_j(S')
+            soft = F.softmax(noisy_scores, dim=-1)  # [B, L, L]
+
+            # S_hard ← one_hot(argmax_j(S'))
+            hard_indices = soft.argmax(dim=-1)  # [B, L]
+            hard = F.one_hot(hard_indices, num_classes=L).float()  # [B, L, L]
+
+            # I ← S_hard + S_soft - sg(S_soft)  (straight-through estimator)
+            indicator = hard + soft - soft.detach()  # [B, L, L]
+
+            # === Step 4: Token Selection ===
+            # H'_fused ← I · H_fused
+            selected_tokens = torch.einsum('bqk,bkd->bqd', indicator, vl_tokens)  # [B, L, D]
+
+            # Log unique token count (for monitoring adaptive behavior)
+            if not self._forward_logged:
+                # Count unique tokens selected (where at least one query selected it)
+                selection_counts = hard.sum(dim=1)  # [B, L]
+                n_unique = (selection_counts > 0).sum(dim=-1).float().mean().item()
+                import logging
+                logging.getLogger(__name__).info(
+                    f"[soft_topk_gumbel] Noise scale: {noise_scale:.4f}, "
+                    f"Avg unique tokens: {n_unique:.1f}/{L}"
+                )
+                self._forward_logged = True
+
+            # Soft weights for return_scores (importance per token)
+            soft_weights = F.softmax(scores.sum(dim=1), dim=-1)  # [B, L]
+
         else:
-            perturbed_scores = scores / temperature
+            # === Inference: Hard selection, deduplicate to unique tokens ===
+            # No noise at inference
+            hard_indices = scores.argmax(dim=-1)  # [B, L] - which token each query selects
 
-        # Soft weights via softmax
-        soft_weights = F.softmax(perturbed_scores, dim=-1)  # [B, N]
+            # Find unique selected tokens and gather them
+            # For inference (typically B=1), we deduplicate to save computation
+            unique_tokens_list = []
+            for b in range(B):
+                unique_indices = hard_indices[b].unique()
 
-        # Hard top-K selection for indices (still needed for output shape)
-        _, topk_indices = soft_weights.topk(K, dim=-1)  # [B, K]
-        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
+                # Sort by total score and limit to K if needed
+                if len(unique_indices) > K:
+                    token_scores = scores[b].sum(dim=0)  # [L]
+                    idx_scores = token_scores[unique_indices]
+                    _, top_idx = idx_scores.topk(K)
+                    unique_indices = unique_indices[top_idx]
 
-        # Get selected tokens
-        selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
+                unique_tokens = vl_tokens[b, unique_indices]  # [n_unique, D]
+                unique_tokens_list.append(unique_tokens)
 
-        # Get corresponding soft weights for gradient flow
-        topk_weights = torch.gather(soft_weights, dim=1, index=topk_indices)  # [B, K]
-        topk_weights_norm = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
+            # For inference, return variable-length unique tokens (no padding needed for B=1)
+            if B == 1:
+                selected_tokens = unique_tokens_list[0].unsqueeze(0)  # [1, n_unique, D]
+            else:
+                # Pad to max length for batched inference (rare case)
+                max_len = max(t.size(0) for t in unique_tokens_list)
+                padded = []
+                for t in unique_tokens_list:
+                    if t.size(0) < max_len:
+                        padding = torch.zeros(max_len - t.size(0), D, device=t.device, dtype=t.dtype)
+                        t = torch.cat([t, padding], dim=0)
+                    padded.append(t)
+                selected_tokens = torch.stack(padded, dim=0)
 
-        # Multiply selected tokens by normalized soft weights for gradient flow
-        # This makes the selection differentiable through the weights
-        selected_tokens = selected_tokens * topk_weights_norm.unsqueeze(-1)
+            soft_weights = F.softmax(scores.sum(dim=1), dim=-1)  # [B, L]
 
-        # Add residual
-        if self.use_residual:
-            global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))
-            selected_context = torch.cat([selected_tokens, global_ctx], dim=1)
-        else:
-            selected_context = selected_tokens
+        # === Optional: Add global residual ===
+        # if self.use_residual:
+        #     global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))  # [B, 1, D]
+        #     selected_tokens = torch.cat([selected_tokens, global_ctx], dim=1)
 
         if return_scores:
-            return selected_context, soft_weights
-        return selected_context
+            return selected_tokens, soft_weights
+        return selected_tokens
 
     def _max_pool_proprio_ctx(self, proprio_tokens, vl_tokens, K, return_scores):
         """
         Config A: Max-pool selection + proprio as separate context tokens.
-        
+
         - Uses L-inf norm for VL token selection (proven effective)
         - Projects proprio tokens to VL space for better alignment
         - Adds global residual for completeness
-        
+
         Output: [B, K + H + 1, D] where H is proprio history length
         """
         B, N, D = vl_tokens.shape
         H = proprio_tokens.shape[1]  # proprio history length
-        
+
         # === Step 1: Max-pool selection (same as _max_pool) ===
         scores = vl_tokens.abs().max(dim=-1)[0]  # [B, N]
         scores_softmax = F.softmax(scores, dim=-1)
-        
+
         _, topk_indices = scores.topk(K, dim=-1)  # [B, K]
         topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
         selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
-        
+
         # === Step 2: Project proprio tokens to VL space for alignment ===
         # proprio_tokens: [B, H, D] - encoded by ProprioHistoryEncoder
         # Project to align with VL feature distribution
         proprio_aligned = self.proprio_to_vl_proj(proprio_tokens)  # [B, H, D]
-        
+
         # === Step 3: Add global residual ===
         if self.use_residual:
             global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))  # [B, 1, D]
@@ -851,7 +1015,7 @@ class ProprioGuidedVLSelector(nn.Module):
             selected_context = torch.cat([selected_tokens, proprio_aligned, global_ctx], dim=1)  # [B, K+H+1, D]
         else:
             selected_context = torch.cat([selected_tokens, proprio_aligned], dim=1)  # [B, K+H, D]
-        
+
         if return_scores:
             return selected_context, scores_softmax
         return selected_context
@@ -859,48 +1023,48 @@ class ProprioGuidedVLSelector(nn.Module):
     def _proprio_max_hybrid(self, proprio_tokens, vl_tokens, K, return_scores):
         """
         Config B: Hybrid scoring (max + proprio) + gated proprio injection.
-        
+
         - Combines L-inf norm scores with proprio-guided attention scores
         - Uses gated addition to inject proprio info into selected features
         - Learnable alpha balances the two scoring methods
-        
+
         Output: [B, K + 1, D]
         """
         B, N, D = vl_tokens.shape
-        
+
         # === Step 1: Compute max-pool scores (L-inf norm) ===
         max_scores = vl_tokens.abs().max(dim=-1)[0]  # [B, N]
         # Normalize to [0, 1] range for fair combination
         max_scores_norm = max_scores / (max_scores.max(dim=-1, keepdim=True)[0] + 1e-8)
-        
+
         # === Step 2: Compute proprio-guided scores ===
         attended = self.cross_attn(proprio_tokens, vl_tokens)  # [B, H, D]
         proprio_summary = attended.mean(dim=1)  # [B, D]
         proprio_scores = torch.einsum('bd,bnd->bn', proprio_summary, vl_tokens)  # [B, N]
         proprio_scores = proprio_scores / (D ** 0.5)
         proprio_scores_norm = F.softmax(proprio_scores, dim=-1)  # [B, N]
-        
+
         # === Step 3: Combine scores with learnable alpha ===
         alpha = self.score_alpha.sigmoid()  # constrain to [0, 1]
         combined_scores = (1 - alpha) * max_scores_norm + alpha * proprio_scores_norm
-        
+
         # === Step 4: Top-K selection based on combined scores ===
         _, topk_indices = combined_scores.topk(K, dim=-1)  # [B, K]
         topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)
         selected_tokens = torch.gather(vl_tokens, dim=1, index=topk_indices_expanded)  # [B, K, D]
-        
+
         # === Step 5: Gated proprio injection ===
         proprio_broadcast = proprio_summary.unsqueeze(1).expand(-1, K, -1)  # [B, K, D]
         gate = self.proprio_gate(proprio_broadcast)  # [B, K, D], values in [0, 1]
         fused = selected_tokens + gate * proprio_broadcast  # gated addition
-        
+
         # === Step 6: Add global residual ===
         if self.use_residual:
             global_ctx = self.global_proj(vl_tokens.mean(dim=1, keepdim=True))  # [B, 1, D]
             selected_context = torch.cat([fused, global_ctx], dim=1)  # [B, K+1, D]
         else:
             selected_context = fused
-        
+
         if return_scores:
             return selected_context, combined_scores
         return selected_context
@@ -941,7 +1105,7 @@ class TimestepEmbedder(nn.Module):
         )
         t_emb = self.mlp(t_freq)
         return t_emb
-    
+
 
 
 
@@ -969,7 +1133,7 @@ class SharedAdaLNController(nn.Module):
         else:
             # Split into 6 parts for self-attention only path
             return mod_signals.chunk(6, dim=-1)
-        
+
 
 
 
@@ -1037,27 +1201,27 @@ class ActionSpaceEmbedderParameter(nn.Module):
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
         self.max_actions = max_actions
-        
+
     def forward(self, action_indices):
         """
         Convert action indices to embeddings using parameter lookup.
-        
+
         Args:
             action_indices: tensor of shape (batch_size,) containing integers in [0, max_actions-1]
         """
         # Index into the parameter matrix
         embeddings = self.action_embeddings[action_indices]
-        
+
         # Process through MLP
         embeddings = embeddings
         output = self.mlp(embeddings)
-        
+
         return output
 
     def get_all_embeddings(self):
         """Returns embeddings for all possible actions."""
         return self.mlp(self.action_embeddings)
-    
+
 
 
 
@@ -1069,5 +1233,3 @@ class ZeroEncoder(nn.Module):
 
     def forward(self, x):
         return torch.zeros((x.shape[0], self.dit_dim), device=self.device)
-    
-

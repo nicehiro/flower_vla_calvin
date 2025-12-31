@@ -978,6 +978,30 @@ class FLOWERVLA(pl.LightningModule):
         self.to(self.device)
         self.vlm.to(self.device)
 
+    def on_train_batch_start(self, batch, batch_idx):
+        """
+        Update VL selector's noise schedule based on training progress.
+        
+        LightVLA-style: noise starts high (exploration) and decays to near-zero
+        (exploitation) following cosine annealing schedule.
+        """
+        if self.use_proprio_vl_selection and hasattr(self, 'vl_selector'):
+            # Compute training progress as fraction of total training
+            if self.trainer.max_steps and self.trainer.max_steps > 0:
+                progress = self.global_step / self.trainer.max_steps
+            elif self.trainer.max_epochs and self.trainer.max_epochs > 0:
+                # Estimate based on epochs if max_steps not set
+                try:
+                    steps_per_epoch = len(self.trainer.train_dataloader)
+                except (TypeError, AttributeError):
+                    steps_per_epoch = 1000  # Fallback estimate
+                total_steps = self.trainer.max_epochs * steps_per_epoch
+                progress = self.global_step / max(total_steps, 1)
+            else:
+                progress = 0.0
+            
+            self.vl_selector.set_training_progress(progress)
+
     def on_validation_start(self):
         """Setup before validation starts."""
         self.eval()
@@ -1070,6 +1094,13 @@ class FLOWERVLA(pl.LightningModule):
                 sync_dist=True, batch_size=total_bs)
         self.log("train/total_loss", total_loss, on_step=False, on_epoch=True,
                 sync_dist=True, batch_size=total_bs)
+        
+        # Log VL selection noise scale if using soft_topk_gumbel mode (LightVLA-style)
+        if (self.use_proprio_vl_selection and 
+            hasattr(self, 'vl_selector') and 
+            hasattr(self.vl_selector, 'current_noise_scale')):
+            self.log("train/vl_selection_noise_scale", self.vl_selector.current_noise_scale,
+                    on_step=True, on_epoch=False, sync_dist=False)
 
     def _log_validation_metrics(self, pred_loss, val_total_act_loss_pp):
         """
