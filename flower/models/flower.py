@@ -28,6 +28,8 @@ from flower.models.networks.transformers import (
     ZeroEncoder,
     FlowBlock,
     stateless_norm,
+)
+from flower.models.networks.proprio_vl_selector import (
     ProprioHistoryEncoder,
     ProprioGuidedVLSelector,
 )
