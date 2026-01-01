@@ -19,15 +19,18 @@ act_dim: 7
 proprio_dims: 9
 obs_dim: 512
 goal_dim: 512
-obs_seq_len: 1
+obs_seq_len: 5
 act_seq_len: 10
 multistep: ${act_seq_len}
 p_last_state: 0
 max_epochs: 40
 rollout_lh_skip_epochs: 9
-num_workers: 1
+num_workers: 4
 benchmark_name: ${libero_benchmark} # calvin_abcd
 libero_benchmark: libero_object # libero_goal # libero_spatial, libero_object, LIBERO_GOAL, LIBERO_90, LIBERO_10
+
+model:
+  proprio_state_dim: ${proprio_dims}  # LIBERO uses 9D (7 joint + 2 gripper)
 
 trainer:
   devices: ${devices}
