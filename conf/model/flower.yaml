@@ -36,7 +36,7 @@ return_act_chunk: false
 # Uses proprio history to select the most relevant VL tokens via cross-attention,
 # then uses only selected tokens as context for DiT cross-attention (compression)
 # ==============================================================================
-use_proprio_vl_selection: true    # Enable proprio-guided VL token selection
+use_proprio_vl_selection: false    # Enable proprio-guided VL token selection
 vl_selection_k: 64                # Top-K VL tokens to keep (out of ~650)
 vl_selection_use_residual: true   # Add global mean-pooled token to preserve info
 vl_selection_use_temporal_attn: true  # Use temporal self-attention in proprio encoder
@@ -56,6 +56,19 @@ vl_selection_mode: "proprio_topk"
 proprio_history_len: 5            # Number of history frames (1 = current state only)
 proprio_state_dim: 15             # State dimension per frame (CALVIN robot_obs is 15D)
 proprio_dropout: 0.0              # Dropout probability in proprio encoder
+
+# ==============================================================================
+# Pre-VLM Vision Token Selection (LightVLA-style)
+# Selects vision patches BEFORE VLM encoder using text-tokenized proprio.
+# Uses binary gating: tokens selected by any query are kept, others zeroed.
+# ==============================================================================
+use_pre_vlm_selection: true
+pre_vlm_use_residual: true
+pre_vlm_num_bins: 256
+pre_vlm_min_value: -3.0
+pre_vlm_max_value: 3.0
+pre_vlm_noise_start: 1.0
+pre_vlm_noise_end: 0.01
 
 # DiT Configuration
 sampling_type: uniform

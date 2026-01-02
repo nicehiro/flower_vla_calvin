@@ -33,6 +33,10 @@ from flower.models.networks.proprio_vl_selector import (
     ProprioHistoryEncoder,
     ProprioGuidedVLSelector,
 )
+from flower.models.networks.pre_vlm_selector import (
+    ProprioTextTokenizer,
+    PreVLMVisionSelector,
+)
 from flower.utils.lr_schedulers.tri_stage_scheduler import TriStageLRScheduler
 from flower.callbacks.ema import EMA
 from flower.models.utils import ActionIndex, generate_policy_prompt
@@ -78,6 +82,16 @@ class FLOWERVLA(pl.LightningModule):
         proprio_history_len: int = 5,
         proprio_state_dim: int = 15,
         proprio_dropout: float = 0.0,
+
+        # Pre-VLM Vision Token Selection (LightVLA-style)
+        # Selects vision patches BEFORE VLM encoder using text-tokenized proprio
+        use_pre_vlm_selection: bool = False,
+        pre_vlm_use_residual: bool = True,
+        pre_vlm_num_bins: int = 256,
+        pre_vlm_min_value: float = -3.0,
+        pre_vlm_max_value: float = 3.0,
+        pre_vlm_noise_start: float = 1.0,
+        pre_vlm_noise_end: float = 0.01,
 
         # DiT Configuration
         sampling_type: str = 'ln',
@@ -131,6 +145,14 @@ class FLOWERVLA(pl.LightningModule):
             proprio_history_len=proprio_history_len,
             proprio_state_dim=proprio_state_dim,
             proprio_dropout=proprio_dropout,
+            # Pre-VLM selection config
+            use_pre_vlm_selection=use_pre_vlm_selection,
+            pre_vlm_use_residual=pre_vlm_use_residual,
+            pre_vlm_num_bins=pre_vlm_num_bins,
+            pre_vlm_min_value=pre_vlm_min_value,
+            pre_vlm_max_value=pre_vlm_max_value,
+            pre_vlm_noise_start=pre_vlm_noise_start,
+            pre_vlm_noise_end=pre_vlm_noise_end,
         )
         self.obs_modalities = []
         # Initialize model dimensions
@@ -354,6 +376,30 @@ class FLOWERVLA(pl.LightningModule):
             logger.info(f"[ProprioVLSelection] Enabled with mode='{self.vl_selection_mode}', K={self.vl_selection_k}, residual={self.vl_selection_use_residual}")
         else:
             logger.info("[ProprioVLSelection] Disabled")
+
+        # Pre-VLM Vision Token Selection (LightVLA-style)
+        if self.use_pre_vlm_selection:
+            vision_dim = self.vlm.config.vision_config.projection_dim
+
+            self.proprio_text_tokenizer = ProprioTextTokenizer(
+                vlm_embeddings=self.vlm.get_input_embeddings(),
+                vocab_size=self.tokenizer.vocab_size,
+                num_bins=self.pre_vlm_num_bins,
+                min_value=self.pre_vlm_min_value,
+                max_value=self.pre_vlm_max_value,
+            )
+
+            self.pre_vlm_selector = PreVLMVisionSelector(
+                vision_dim=vision_dim,
+                use_residual=self.pre_vlm_use_residual,
+                gumbel_noise_start=self.pre_vlm_noise_start,
+                gumbel_noise_end=self.pre_vlm_noise_end,
+            )
+
+            logger.info(f"[PreVLMSelection] Enabled: bins={self.pre_vlm_num_bins}")
+        else:
+            self.proprio_text_tokenizer = None
+            self.pre_vlm_selector = None
 
     def _setup_dit_components(self, **kwargs):
         """Setup DiT model components"""
@@ -784,6 +830,31 @@ class FLOWERVLA(pl.LightningModule):
             image2_features = image2_features.view(B, 1 * image2_features.shape[1], -1)
             image_features = torch.cat([image_features, image2_features], dim=1)
 
+        # === Pre-VLM Vision Token Selection (LightVLA-style) ===
+        # Select vision tokens BEFORE they enter the VLM encoder
+        if self.use_pre_vlm_selection and self.pre_vlm_selector is not None and self.proprio_text_tokenizer is not None:
+            # Get proprio history from batch
+            if 'robot_obs' not in batch:
+                raise ValueError(
+                    "use_pre_vlm_selection=True requires 'robot_obs' in batch, "
+                    "but it was not provided."
+                )
+            proprio_history = batch['robot_obs'].to(device).to(default_type)  # [B, H, state_dim]
+
+            # Convert proprio to VLM text embeddings
+            proprio_embeds = self.proprio_text_tokenizer(proprio_history)  # [B, H*state_dim, vlm_dim]
+
+            # Select vision tokens using proprio as query
+            image_features = self.pre_vlm_selector(image_features, proprio_embeds)
+
+            if not hasattr(self, '_pre_vlm_selection_logged'):
+                logger.info(
+                    f"[PreVLMSelection] proprio_history: {proprio_history.shape} -> "
+                    f"proprio_embeds: {proprio_embeds.shape} -> "
+                    f"selected_vision: {image_features.shape}"
+                )
+                self._pre_vlm_selection_logged = True
+
         # Get text embeddings
         constructed_prompts = self.construct_prompts(batch)
         text_embeds = self._get_text_embeddings(constructed_prompts, device)
@@ -891,7 +962,8 @@ class FLOWERVLA(pl.LightningModule):
             "lang_text": [goal["lang_text"]]
         }
         # Add robot_obs for proprio history encoding if VL selection is enabled
-        if self.use_proprio_vl_selection and "robot_obs" in obs:
+        # (either post-VLM or pre-VLM selection modes)
+        if (self.use_proprio_vl_selection or self.use_pre_vlm_selection) and "robot_obs" in obs:
             robot_obs = obs["robot_obs"]
             # Wrapper provides [B, state_dim], we need [B, history_len, state_dim]
             if robot_obs.dim() == 2:
@@ -1000,6 +1072,19 @@ class FLOWERVLA(pl.LightningModule):
                 progress = 0.0
             
             self.vl_selector.set_training_progress(progress)
+
+        # Update pre-VLM selector's noise schedule (same logic)
+        if self.use_pre_vlm_selection and hasattr(self, 'pre_vlm_selector') and self.pre_vlm_selector is not None:
+            if self.trainer.max_steps and self.trainer.max_steps > 0:
+                progress = self.global_step / self.trainer.max_steps
+            elif self.trainer.max_epochs and self.trainer.max_epochs > 0:
+                steps_per_epoch = self.trainer.num_training_batches
+                total_steps = self.trainer.max_epochs * steps_per_epoch
+                progress = self.global_step / max(total_steps, 1)
+            else:
+                progress = 0.0
+
+            self.pre_vlm_selector.set_training_progress(progress)
 
     def on_validation_start(self):
         """Setup before validation starts."""
