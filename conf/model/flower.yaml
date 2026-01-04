@@ -53,16 +53,21 @@ vl_selection_per_layer: false     # If True, select per DiT layer (future extens
 vl_selection_mode: "proprio_topk"
 
 # Proprio configuration
-proprio_history_len: 5            # Number of history frames (1 = current state only)
+proprio_history_len: 1            # Number of history frames (1 = current state only)
 proprio_state_dim: 15             # State dimension per frame (CALVIN robot_obs is 15D)
 proprio_dropout: 0.0              # Dropout probability in proprio encoder
 
 # ==============================================================================
 # Pre-VLM Vision Token Selection (LightVLA-style)
-# Selects vision patches BEFORE VLM encoder using text-tokenized proprio.
+# Selects vision patches BEFORE VLM encoder using text-tokenized queries.
 # Uses binary gating: tokens selected by any query are kept, others zeroed.
+# Selection mode options:
+#   - text: Use task/instruction text as query (original LightVLA)
+#   - proprio: Use text-tokenized proprio state as query
+#   - text_proprio: Concatenate text + proprio as query source
 # ==============================================================================
 use_pre_vlm_selection: true
+pre_vlm_selection_mode: "proprio"  # text | proprio | text_proprio
 pre_vlm_use_residual: true
 pre_vlm_num_bins: 256
 pre_vlm_min_value: -3.0

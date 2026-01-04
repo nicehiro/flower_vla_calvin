@@ -84,8 +84,9 @@ class FLOWERVLA(pl.LightningModule):
         proprio_dropout: float = 0.0,
 
         # Pre-VLM Vision Token Selection (LightVLA-style)
-        # Selects vision patches BEFORE VLM encoder using text-tokenized proprio
+        # Selects vision patches BEFORE VLM encoder using text-tokenized queries
         use_pre_vlm_selection: bool = False,
+        pre_vlm_selection_mode: str = "proprio",  # text | proprio | text_proprio
         pre_vlm_use_residual: bool = True,
         pre_vlm_num_bins: int = 256,
         pre_vlm_min_value: float = -3.0,
@@ -147,6 +148,7 @@ class FLOWERVLA(pl.LightningModule):
             proprio_dropout=proprio_dropout,
             # Pre-VLM selection config
             use_pre_vlm_selection=use_pre_vlm_selection,
+            pre_vlm_selection_mode=pre_vlm_selection_mode,
             pre_vlm_use_residual=pre_vlm_use_residual,
             pre_vlm_num_bins=pre_vlm_num_bins,
             pre_vlm_min_value=pre_vlm_min_value,
@@ -391,12 +393,16 @@ class FLOWERVLA(pl.LightningModule):
 
             self.pre_vlm_selector = PreVLMVisionSelector(
                 vision_dim=vision_dim,
+                selection_mode=self.pre_vlm_selection_mode,
                 use_residual=self.pre_vlm_use_residual,
                 gumbel_noise_start=self.pre_vlm_noise_start,
                 gumbel_noise_end=self.pre_vlm_noise_end,
             )
 
-            logger.info(f"[PreVLMSelection] Enabled: bins={self.pre_vlm_num_bins}")
+            logger.info(
+                f"[PreVLMSelection] Enabled: mode={self.pre_vlm_selection_mode}, "
+                f"bins={self.pre_vlm_num_bins}"
+            )
         else:
             self.proprio_text_tokenizer = None
             self.pre_vlm_selector = None
@@ -425,7 +431,7 @@ class FLOWERVLA(pl.LightningModule):
                 "max_pool_proprio_ctx",   # Config A: needs proprio tokens as context
                 "proprio_max_hybrid",     # Config B: needs proprio for scoring + injection
             ]
-            
+
             # Only create proprio_encoder for modes that need it
             if self.vl_selection_mode in proprio_based_modes:
                 self.proprio_encoder = ProprioHistoryEncoder(
@@ -445,7 +451,7 @@ class FLOWERVLA(pl.LightningModule):
                 logger.info(
                     f"[ProprioVLSelection] proprio_encoder skipped for mode='{self.vl_selection_mode}'"
                 )
-            
+
             self.vl_selector = ProprioGuidedVLSelector(
                 dim=dit_dim,
                 n_heads=8,
@@ -719,7 +725,7 @@ class FLOWERVLA(pl.LightningModule):
             else:
                 # Modes that don't use proprio (random, mean_pool, max_pool)
                 proprio_tokens = None
-            
+
             # Select VL tokens using the configured mode
             context = self.vl_selector(proprio_tokens, cond)
 
@@ -830,44 +836,68 @@ class FLOWERVLA(pl.LightningModule):
             image2_features = image2_features.view(B, 1 * image2_features.shape[1], -1)
             image_features = torch.cat([image_features, image2_features], dim=1)
 
-        # === Pre-VLM Vision Token Selection (LightVLA-style) ===
-        # Select vision tokens BEFORE they enter the VLM encoder
-        if self.use_pre_vlm_selection and self.pre_vlm_selector is not None and self.proprio_text_tokenizer is not None:
-            # Get proprio history from batch
-            if 'robot_obs' not in batch:
-                raise ValueError(
-                    "use_pre_vlm_selection=True requires 'robot_obs' in batch, "
-                    "but it was not provided."
-                )
-            proprio_history = batch['robot_obs'].to(device).to(default_type)  # [B, H, state_dim]
-
-            # Convert proprio to VLM text embeddings
-            proprio_embeds = self.proprio_text_tokenizer(proprio_history)  # [B, H*state_dim, vlm_dim]
-
-            # Select vision tokens using proprio as query
-            image_features = self.pre_vlm_selector(image_features, proprio_embeds)
-
-            if not hasattr(self, '_pre_vlm_selection_logged'):
-                logger.info(
-                    f"[PreVLMSelection] proprio_history: {proprio_history.shape} -> "
-                    f"proprio_embeds: {proprio_embeds.shape} -> "
-                    f"selected_vision: {image_features.shape}"
-                )
-                self._pre_vlm_selection_logged = True
-
-        # Get text embeddings
+        # Get text embeddings (needed for VLM encoder and potentially pre-VLM selection)
         constructed_prompts = self.construct_prompts(batch)
         text_embeds = self._get_text_embeddings(constructed_prompts, device)
+
+        # === Pre-VLM Vision Token Selection (LightVLA-style) ===
+        # Select vision tokens BEFORE they enter the VLM encoder
+        if self.use_pre_vlm_selection and self.pre_vlm_selector is not None:
+            selection_mode = self.pre_vlm_selection_mode
+            proprio_embeds = None
+            selection_text_embeds = None
+
+            # Get proprio embeddings if mode requires them
+            if selection_mode in ("proprio", "text_proprio"):
+                if self.proprio_text_tokenizer is None:
+                    raise ValueError(
+                        f"pre_vlm_selection_mode='{selection_mode}' requires proprio_text_tokenizer"
+                    )
+                if 'robot_obs' not in batch:
+                    raise ValueError(
+                        f"pre_vlm_selection_mode='{selection_mode}' requires 'robot_obs' in batch"
+                    )
+                proprio_history = batch['robot_obs'].to(device).to(default_type)  # [B, H, state_dim]
+                proprio_embeds = self.proprio_text_tokenizer(proprio_history)  # [B, H*state_dim, vlm_dim]
+
+            # Get text embeddings for selection if mode requires them
+            if selection_mode in ("text", "text_proprio"):
+                selection_text_embeds = text_embeds
+
+            # Select vision tokens using the appropriate query source
+            image_features = self.pre_vlm_selector(
+                image_features,
+                proprio_embeds=proprio_embeds,
+                text_embeds=selection_text_embeds,
+            )
+
+            if not hasattr(self, '_pre_vlm_selection_logged'):
+                log_parts = [f"[PreVLMSelection] mode={selection_mode}"]
+                if proprio_embeds is not None:
+                    log_parts.append(f"proprio_embeds: {proprio_embeds.shape}")
+                if selection_text_embeds is not None:
+                    log_parts.append(f"text_embeds: {selection_text_embeds.shape}")
+                log_parts.append(f"selected_vision: {image_features.shape}")
+                logger.info(" | ".join(log_parts))
+                self._pre_vlm_selection_logged = True
 
         # Add task prompt and aggregation tokens
         task_prompt = self.prompt_embeds.expand(B, -1, -1).to(image_features.device)
 
         # Merge sequence: [image_features, task_prompt, text_embeds]
-        merged_embeds = torch.cat([
-            image_features,
-            task_prompt,
-            text_embeds.to(image_features.device)
-        ], dim=1)
+        if self.use_pre_vlm_selection and self.pre_vlm_selector is not None and selection_mode in ("proprio", "text_proprio"):
+            merged_embeds = torch.cat([
+                image_features,
+                proprio_embeds.to(image_features.device),
+                task_prompt,
+                text_embeds.to(image_features.device),
+            ], dim=1)
+        else:
+            merged_embeds = torch.cat([
+                image_features,
+                task_prompt,
+                text_embeds.to(image_features.device),
+            ], dim=1)
 
         # Create attention mask
         attention_mask = torch.ones(merged_embeds.shape[:2], device=merged_embeds.device)
@@ -1055,7 +1085,7 @@ class FLOWERVLA(pl.LightningModule):
     def on_train_batch_start(self, batch, batch_idx):
         """
         Update VL selector's noise schedule based on training progress.
-        
+
         LightVLA-style: noise starts high (exploration) and decays to near-zero
         (exploitation) following cosine annealing schedule.
         """
@@ -1070,7 +1100,7 @@ class FLOWERVLA(pl.LightningModule):
                 progress = self.global_step / max(total_steps, 1)
             else:
                 progress = 0.0
-            
+
             self.vl_selector.set_training_progress(progress)
 
         # Update pre-VLM selector's noise schedule (same logic)
@@ -1178,13 +1208,30 @@ class FLOWERVLA(pl.LightningModule):
                 sync_dist=True, batch_size=total_bs)
         self.log("train/total_loss", total_loss, on_step=False, on_epoch=True,
                 sync_dist=True, batch_size=total_bs)
-        
+
         # Log VL selection noise scale if using soft_topk_gumbel mode (LightVLA-style)
-        if (self.use_proprio_vl_selection and 
-            hasattr(self, 'vl_selector') and 
+        if (self.use_proprio_vl_selection and
+            hasattr(self, 'vl_selector') and
             hasattr(self.vl_selector, 'current_noise_scale')):
             self.log("train/vl_selection_noise_scale", self.vl_selector.current_noise_scale,
                     on_step=True, on_epoch=False, sync_dist=False)
+
+        # Log pre-VLM selection compression ratio
+        if (self.use_pre_vlm_selection and
+            hasattr(self, 'pre_vlm_selector') and
+            self.pre_vlm_selector is not None and
+            hasattr(self.pre_vlm_selector, '_last_compression_ratio')):
+            self.log("train/pre_vlm_compression_ratio", self.pre_vlm_selector._last_compression_ratio,
+                    on_step=True, on_epoch=False, sync_dist=False)
+            self.log("train/pre_vlm_tokens_selected", self.pre_vlm_selector._last_num_selected,
+                    on_step=True, on_epoch=False, sync_dist=False)
+
+            # Log diagnostic metrics (computed every 100 steps)
+            if hasattr(self.pre_vlm_selector, '_diagnostics') and self.pre_vlm_selector._diagnostics:
+                for key, value in self.pre_vlm_selector._diagnostics.items():
+                    self.log(f"train/{key}", value, on_step=True, on_epoch=False, sync_dist=False)
+                # Clear diagnostics after logging to avoid re-logging stale values
+                self.pre_vlm_selector._diagnostics = {}
 
     def _log_validation_metrics(self, pred_loss, val_total_act_loss_pp):
         """
