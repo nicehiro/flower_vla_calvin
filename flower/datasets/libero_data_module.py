@@ -92,8 +92,10 @@ class TranslatedSequenceVLDataset(Dataset):
         translated_dict['lang_text'] = dict['lang_text']
         translated_dict['depth_obs'] = {}
         translated_dict['actions'] = dict['actions']
-        # translated_dict['robot_obs'] = dict['robot_obs']
-        translated_dict['robot_obs'] = np.concatenate([dict['robot_obs'], np.expand_dims(dict['obs']['gripper_states'][0], 0)], axis=-1)
+        # Concatenate joint_states and gripper_states for all history frames
+        # dict['robot_obs'] shape: [obs_seq_len, 7] (joint_states)
+        # dict['gripper_states'] shape: [obs_seq_len, 2] (gripper)
+        translated_dict['robot_obs'] = np.concatenate([dict['robot_obs'], dict['gripper_states']], axis=-1)
         return translated_dict
 
     def combine_goal_obs_with_obs(self, obs, goal_obs):

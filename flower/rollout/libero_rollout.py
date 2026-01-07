@@ -398,7 +398,12 @@ class RolloutLibero(Callback):
         translated_dict['rgb_obs'] = {}
         translated_dict['rgb_obs']['rgb_static'] = obs_space['agentview_image']
         translated_dict["rgb_obs"]['rgb_gripper'] = obs_space['robot0_eye_in_hand_image']
-        translated_dict['robot_obs'] = obs_space['robot0_joint_pos']
+        # Concatenate joint_pos (7D) + gripper_qpos (2D) = 9D to match training
+        robot_obs = np.concatenate([
+            obs_space['robot0_joint_pos'],
+            obs_space['robot0_gripper_qpos']
+        ], axis=-1)
+        translated_dict['robot_obs'] = robot_obs
         translated_dict['gripper_states'] = obs_space['robot0_gripper_qpos']
         translated_dict['depth_obs'] = {}
 
@@ -417,6 +422,15 @@ class RolloutLibero(Callback):
                 x = transform(x)
             data['rgb_obs'][key] = x.unsqueeze(0).to(self.device)
             # data['rgb_obs'][key] = transforms[key](data['rgb_obs'][key])
+
+        # Convert robot_obs from numpy to tensor
+        if 'robot_obs' in data and data['robot_obs'] is not None:
+            robot_obs = data['robot_obs']
+            if isinstance(robot_obs, np.ndarray):
+                robot_obs = torch.from_numpy(robot_obs).float()
+            if robot_obs.dim() == 1:
+                robot_obs = robot_obs.unsqueeze(0)  # Add batch dim
+            data['robot_obs'] = robot_obs.to(self.device)
 
         return data
 
