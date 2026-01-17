@@ -6,24 +6,24 @@ defaults:
   - override hydra/hydra_logging: colorlog
 
 root_data_dir: /data/fywang/Calvin/task_ABC_D/
-lang_folder: lang_clip_resnet50
+lang_folder: lang_annotations
 
-log_dir: /outputs/logs/
+log_dir: /output/logs/
 slurm: false
 seed: 242
 device: 'cuda'
 batch_size: 32
-devices: 1
+devices: 2
 act_dim: 7
 proprio_dims: 7
 obs_dim: 512
 goal_dim: 512
-obs_seq_len: 5  # Changed from 1 to support proprio history
+obs_seq_len: 1  # Changed from 1 to support proprio history
 act_seq_len: 10
 multistep: 10 #${act_seq_len}
 p_last_state: 0
 gen_img_res: 112
-max_epochs: 35
+max_epochs: 50
 rollout_lh_skip_epochs: 19
 num_workers: 12
 benchmark_name: calvin_d # calvin_abcd

@@ -179,9 +179,10 @@ class PreVLMVisionSelector(nn.Module):
 
             # Selection distribution analysis
             # selection_counts: [B, V] - how many times each token was selected
-            max_count = selection_counts[0].max().item()
-            mean_count = selection_counts[0].mean().item()
-            std_count = selection_counts[0].std().item()
+            selection_counts_0 = selection_counts[0].float()
+            max_count = selection_counts_0.max().item()
+            mean_count = selection_counts_0.mean().item()
+            std_count = selection_counts_0.std().item()
             diag["pre_vlm/max_selection_count"] = max_count
             diag["pre_vlm/mean_selection_count"] = mean_count
             diag["pre_vlm/std_selection_count"] = std_count
@@ -223,6 +224,8 @@ class PreVLMVisionSelector(nn.Module):
         self,
         query_embeds: torch.Tensor,
         vision_tokens: torch.Tensor,
+        query_attention_mask: Optional[torch.Tensor] = None,
+        return_attn_weights: bool = False,
     ) -> tuple:
         """Generate one query per vision token via cross-attention.
 
@@ -239,10 +242,16 @@ class PreVLMVisionSelector(nn.Module):
             query_embeds: [B, P, D] - text-tokenized query embeddings
                           (text, proprio, or concatenated depending on mode)
             vision_tokens: [B, V, D] - vision patches from vision encoder
+            query_attention_mask: Optional [B, P] mask where 1=valid, 0=pad.
+                If provided, padded query tokens are masked out of the
+                vision->query attention.
+            return_attn_weights: If True, also return vision->query attention
+                weights of shape [B, V, P].
 
         Returns:
-            queries: [B, V, D] - normalized queries, one per vision token
+            queries: [B, V, D] - per-vision queries
             vision_normed: [B, V, D] - normalized vision tokens (for scoring)
+            (optional) attn_weights: [B, V, P] - vision->query attention weights
         """
         B, V, D = vision_tokens.shape
 
@@ -253,11 +262,20 @@ class PreVLMVisionSelector(nn.Module):
         # Step 3: Cross-attention to generate queries
         # Q = softmax(H_v @ H_l^T / √D) @ H_l
         attn_logits = torch.einsum('bvd,bpd->bvp', vision_normed, query_normed) / (D ** 0.5)
+
+        if query_attention_mask is not None:
+            mask = query_attention_mask.to(device=attn_logits.device, dtype=torch.bool).unsqueeze(1)  # [B, 1, P]
+            mask_value = torch.finfo(attn_logits.dtype).min
+            attn_logits = attn_logits.masked_fill(~mask, mask_value)
+
         attn_weights = F.softmax(attn_logits, dim=-1)  # [B, V, P]
         queries = torch.einsum('bvp,bpd->bvd', attn_weights, query_normed)  # [B, V, D]
 
         # Step 4: Normalize queries (LightVLA does this!)
         queries = self.query_out_norm(queries)  # [B, V, D]
+
+        if return_attn_weights:
+            return queries, vision_normed, attn_weights
 
         return queries, vision_normed
 
@@ -266,6 +284,8 @@ class PreVLMVisionSelector(nn.Module):
         vision_tokens: torch.Tensor,
         proprio_embeds: Optional[torch.Tensor] = None,
         text_embeds: Optional[torch.Tensor] = None,
+        query_attention_mask: Optional[torch.Tensor] = None,
+        return_mask: bool = False,
         return_scores: bool = False,
     ) -> torch.Tensor:
         B, V, D = vision_tokens.shape
@@ -286,57 +306,84 @@ class PreVLMVisionSelector(nn.Module):
             query_embeds = torch.cat([text_embeds, proprio_embeds], dim=1)
 
         # LightVLA: generate queries and get normalized vision for scoring
-        queries, vision_normed = self._generate_per_vision_queries(query_embeds, vision_tokens)
+        queries, vision_normed = self._generate_per_vision_queries(
+            query_embeds,
+            vision_tokens,
+            query_attention_mask=query_attention_mask,
+            return_attn_weights=False,
+        )
 
         # Score = Q @ H_v^T / √D (against normalized vision, not original!)
         scores = torch.einsum('bqd,bkd->bqk', queries, vision_normed) / (D ** 0.5)
 
+        vis_soft_indicator = None
+        if return_scores:
+            # Visualization importance (no noise): expected selection histogram under softmax relaxation.
+            # Shape: [B, V]
+            vis_soft_indicator = F.softmax(scores, dim=-1).sum(dim=1) / V
+
         if self.training:
             noise_scale = self.current_noise_scale
+            # Use Gumbel noise for proper categorical exploration (Gumbel-max trick)
+            # uniform = torch.rand_like(scores).clamp(1e-10, 1 - 1e-10)
+            # gumbel_noise = -torch.log(-torch.log(uniform))
+            # noisy_scores = scores + gumbel_noise * noise_scale
             noisy_scores = scores + torch.rand_like(scores) * noise_scale
             soft = F.softmax(noisy_scores, dim=-1)
             hard_indices = noisy_scores.argmax(dim=-1)
 
             device = vision_tokens.device
-            selection_counts = torch.zeros(B, V, device=device, dtype=vision_tokens.dtype)
+            selection_counts = torch.zeros(B, V, device=device, dtype=torch.int32)
             selection_counts.scatter_add_(
-                1, hard_indices,
-                torch.ones(B, V, device=device, dtype=vision_tokens.dtype)
+                1,
+                hard_indices,
+                torch.ones(B, V, device=device, dtype=torch.int32),
             )
             hard_mask = selection_counts > 0
 
             # STE for gradient flow
-            soft_indicator = soft.sum(dim=1) / V
+            soft_indicator_noisy = soft.sum(dim=1) / V
             hard_indicator = hard_mask.float()
-            indicator = hard_indicator + soft_indicator - soft_indicator.detach()
+            indicator = hard_indicator + soft_indicator_noisy - soft_indicator_noisy.detach()
 
             # Actually remove unselected tokens (LightVLA-style)
             num_selected = int(hard_mask[0].sum().item())
             if num_selected > 0:
-                selected_tokens = self._gather_selected(vision_tokens, hard_mask, indicator)
+                selected_tokens, selected_attention_mask = self._gather_selected(
+                    vision_tokens, hard_mask, indicator
+                )
             else:
                 selected_tokens = vision_tokens[:, :1, :]
+                selected_attention_mask = torch.ones(
+                    (B, 1), device=device, dtype=torch.long
+                )
                 num_selected = 1
 
-            soft_weights = F.softmax(scores.sum(dim=1), dim=-1)
+            soft_weights = None
         else:
             hard_indices = scores.argmax(dim=-1)
             device = vision_tokens.device
-            selection_counts = torch.zeros(B, V, device=device, dtype=vision_tokens.dtype)
+            selection_counts = torch.zeros(B, V, device=device, dtype=torch.int32)
             selection_counts.scatter_add_(
-                1, hard_indices,
-                torch.ones(B, V, device=device, dtype=vision_tokens.dtype)
+                1,
+                hard_indices,
+                torch.ones(B, V, device=device, dtype=torch.int32),
             )
             hard_mask = selection_counts > 0
 
             num_selected = int(hard_mask[0].sum().item())
             if num_selected > 0:
-                selected_tokens = self._gather_selected_inference(vision_tokens, hard_mask)
+                selected_tokens, selected_attention_mask = self._gather_selected_inference(
+                    vision_tokens, hard_mask
+                )
             else:
                 selected_tokens = vision_tokens[:, :1, :]
+                selected_attention_mask = torch.ones(
+                    (B, 1), device=device, dtype=torch.long
+                )
                 num_selected = 1
 
-            soft_weights = F.softmax(scores.sum(dim=1), dim=-1)
+            soft_weights = None
 
         self._last_num_selected = num_selected
         self._last_num_total = V
@@ -364,9 +411,25 @@ class PreVLMVisionSelector(nn.Module):
         if self.use_residual:
             global_ctx = self.global_proj(vision_tokens.mean(dim=1, keepdim=True))
             selected_tokens = torch.cat([selected_tokens, global_ctx], dim=1)
+            selected_attention_mask = torch.cat(
+                [
+                    selected_attention_mask,
+                    torch.ones((B, 1), device=device, dtype=torch.long),
+                ],
+                dim=1,
+            )
 
         if return_scores:
+            if vis_soft_indicator is None:
+                raise RuntimeError("vis_soft_indicator is required when return_scores=True")
+            soft_weights = vis_soft_indicator
+
+            if return_mask:
+                return selected_tokens, soft_weights, selected_attention_mask
             return selected_tokens, soft_weights
+
+        if return_mask:
+            return selected_tokens, selected_attention_mask
         return selected_tokens
 
     def _gather_selected(
@@ -374,44 +437,56 @@ class PreVLMVisionSelector(nn.Module):
         vision_tokens: torch.Tensor,
         hard_mask: torch.Tensor,
         indicator: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather selected tokens with STE gradient flow.
-        
+
         Training: applies indicator weights to maintain gradient flow through
         soft_indicator while using hard selection for forward pass.
         """
         B, V, D = vision_tokens.shape
-        
+
         selected_list = []
         for b in range(B):
             mask_b = hard_mask[b]
             tokens_b = vision_tokens[b][mask_b]
             weights_b = indicator[b][mask_b].unsqueeze(-1)
             selected_list.append(tokens_b * weights_b)
-        
+
         max_len = max(s.shape[0] for s in selected_list)
-        padded = torch.zeros(B, max_len, D, device=vision_tokens.device, dtype=vision_tokens.dtype)
+        padded = torch.zeros(
+            B, max_len, D, device=vision_tokens.device, dtype=vision_tokens.dtype
+        )
+        attention_mask = torch.zeros(
+            B, max_len, device=vision_tokens.device, dtype=torch.long
+        )
         for b, sel in enumerate(selected_list):
-            padded[b, :sel.shape[0]] = sel
-        
-        return padded
+            padded[b, : sel.shape[0]] = sel
+            attention_mask[b, : sel.shape[0]] = 1
+
+        return padded, attention_mask
 
     def _gather_selected_inference(
         self,
         vision_tokens: torch.Tensor,
         hard_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather selected tokens for inference (no gradient needed)."""
         B, V, D = vision_tokens.shape
-        
+
         selected_list = []
         for b in range(B):
             mask_b = hard_mask[b]
             selected_list.append(vision_tokens[b][mask_b])
-        
+
         max_len = max(s.shape[0] for s in selected_list)
-        padded = torch.zeros(B, max_len, D, device=vision_tokens.device, dtype=vision_tokens.dtype)
+        padded = torch.zeros(
+            B, max_len, D, device=vision_tokens.device, dtype=vision_tokens.dtype
+        )
+        attention_mask = torch.zeros(
+            B, max_len, device=vision_tokens.device, dtype=torch.long
+        )
         for b, sel in enumerate(selected_list):
-            padded[b, :sel.shape[0]] = sel
-        
-        return padded
+            padded[b, : sel.shape[0]] = sel
+            attention_mask[b, : sel.shape[0]] = 1
+
+        return padded, attention_mask

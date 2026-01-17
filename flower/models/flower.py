@@ -838,7 +838,9 @@ class FLOWERVLA(pl.LightningModule):
 
         # Get text embeddings (needed for VLM encoder and potentially pre-VLM selection)
         constructed_prompts = self.construct_prompts(batch)
-        text_embeds = self._get_text_embeddings(constructed_prompts, device)
+        text_embeds, text_attention_mask = self._get_text_embeddings(
+            constructed_prompts, device
+        )
 
         # === Pre-VLM Vision Token Selection (LightVLA-style) ===
         # Select vision tokens BEFORE they enter the VLM encoder
@@ -864,11 +866,30 @@ class FLOWERVLA(pl.LightningModule):
             if selection_mode in ("text", "text_proprio"):
                 selection_text_embeds = text_embeds
 
-            # Select vision tokens using the appropriate query source
-            image_features = self.pre_vlm_selector(
+            # Build query attention mask so padded text tokens don't affect selection.
+            query_attention_mask = None
+            if selection_mode == "text":
+                query_attention_mask = text_attention_mask
+            elif selection_mode == "proprio":
+                query_attention_mask = torch.ones(
+                    (B, proprio_embeds.shape[1]),
+                    device=device,
+                    dtype=text_attention_mask.dtype,
+                )
+            elif selection_mode == "text_proprio":
+                proprio_query_mask = torch.ones(
+                    (B, proprio_embeds.shape[1]),
+                    device=device,
+                    dtype=text_attention_mask.dtype,
+                )
+                query_attention_mask = torch.cat([text_attention_mask, proprio_query_mask], dim=1)
+
+            image_features, vision_attention_mask = self.pre_vlm_selector(
                 image_features,
                 proprio_embeds=proprio_embeds,
                 text_embeds=selection_text_embeds,
+                query_attention_mask=query_attention_mask,
+                return_mask=True,
             )
 
             if not hasattr(self, '_pre_vlm_selection_logged'):
@@ -884,23 +905,76 @@ class FLOWERVLA(pl.LightningModule):
         # Add task prompt and aggregation tokens
         task_prompt = self.prompt_embeds.expand(B, -1, -1).to(image_features.device)
 
-        # Merge sequence: [image_features, task_prompt, text_embeds]
-        if self.use_pre_vlm_selection and self.pre_vlm_selector is not None and selection_mode in ("proprio", "text_proprio"):
-            merged_embeds = torch.cat([
-                image_features,
-                proprio_embeds.to(image_features.device),
-                task_prompt,
-                text_embeds.to(image_features.device),
-            ], dim=1)
-        else:
-            merged_embeds = torch.cat([
-                image_features,
-                task_prompt,
-                text_embeds.to(image_features.device),
-            ], dim=1)
+        # If we didn't run the selector, keep all vision tokens.
+        if not (self.use_pre_vlm_selection and self.pre_vlm_selector is not None):
+            vision_attention_mask = torch.ones(
+                (B, image_features.shape[1]),
+                device=image_features.device,
+                dtype=text_attention_mask.dtype,
+            )
 
-        # Create attention mask
-        attention_mask = torch.ones(merged_embeds.shape[:2], device=merged_embeds.device)
+        # Merge sequence: [image_features, task_prompt, text_embeds]
+        if (
+            self.use_pre_vlm_selection
+            and self.pre_vlm_selector is not None
+            and selection_mode in ("proprio", "text_proprio")
+        ):
+            merged_embeds = torch.cat(
+                [
+                    image_features,
+                    proprio_embeds.to(image_features.device),
+                    task_prompt,
+                    text_embeds.to(image_features.device),
+                ],
+                dim=1,
+            )
+
+            proprio_attention_mask = torch.ones(
+                (B, proprio_embeds.shape[1]),
+                device=image_features.device,
+                dtype=text_attention_mask.dtype,
+            )
+        else:
+            merged_embeds = torch.cat(
+                [
+                    image_features,
+                    task_prompt,
+                    text_embeds.to(image_features.device),
+                ],
+                dim=1,
+            )
+            proprio_attention_mask = None
+
+        # Create attention mask (critical: mask out padding tokens)
+        vision_attention_mask = vision_attention_mask.to(
+            merged_embeds.device, dtype=text_attention_mask.dtype
+        )
+        task_prompt_attention_mask = torch.ones(
+            (B, task_prompt.shape[1]),
+            device=merged_embeds.device,
+            dtype=text_attention_mask.dtype,
+        )
+        text_attention_mask = text_attention_mask.to(
+            merged_embeds.device, dtype=text_attention_mask.dtype
+        )
+
+        if proprio_attention_mask is not None:
+            attention_mask = torch.cat(
+                [
+                    vision_attention_mask,
+                    proprio_attention_mask.to(
+                        merged_embeds.device, dtype=text_attention_mask.dtype
+                    ),
+                    task_prompt_attention_mask,
+                    text_attention_mask,
+                ],
+                dim=1,
+            )
+        else:
+            attention_mask = torch.cat(
+                [vision_attention_mask, task_prompt_attention_mask, text_attention_mask],
+                dim=1,
+            )
 
         # Process through encoder
         features = self.vlm.get_encoder()(
@@ -1186,15 +1260,18 @@ class FLOWERVLA(pl.LightningModule):
         return text_prompts
 
     def _get_text_embeddings(self, text, device):
-        """Get text embeddings to use with VLM"""
+        """Get text embeddings (and attention mask) for VLM encoder."""
         text_inputs = self.tokenizer(
             text,
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=77
+            max_length=77,
         ).to(device)
-        return self.vlm.get_input_embeddings()(text_inputs["input_ids"])
+
+        text_embeds = self.vlm.get_input_embeddings()(text_inputs["input_ids"])
+        text_attention_mask = text_inputs["attention_mask"]
+        return text_embeds, text_attention_mask
 
     def _log_training_metrics(self, total_loss, action_loss, total_bs):
         """
