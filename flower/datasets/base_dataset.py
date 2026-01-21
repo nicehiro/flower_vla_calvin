@@ -4,7 +4,7 @@ from typing import Dict, Tuple, Union
 
 import numpy as np
 from omegaconf import DictConfig
-import pyhash
+import mmh3
 import torch
 from torch.utils.data import Dataset
 
@@ -17,7 +17,7 @@ from flower.datasets.utils.episode_utils import (
     process_state,
 )
 
-hasher = pyhash.fnv1_32()
+hasher = lambda x: mmh3.hash(x)
 logger = logging.getLogger(__name__)
 
 

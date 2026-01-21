@@ -10,17 +10,17 @@ eval_cfg_overwrite:
   model:
     num_sampling_steps: ${num_sampling_steps}
 
-train_folder: /home/hk-project-sustainebot/ft4740/code/flower_vla_calvin/logs/best_checkpoints/calvin_abcd/.hydra/config.yaml
-checkpoint: /home/hk-project-sustainebot/ft4740/code/flower_vla_calvin/logs/best_checkpoints/calvin_abcd/seed_342/avg_seq_len=4.72.ckpt
+train_folder: /model/fywang/flower-calvin-abc-d/13-51-18_seed242/
+checkpoint: /model/fywang/flower-calvin-abc-d/13-51-18_seed242/seed_242/saved_models/epoch=44_eval_lh/avg_seq_len=4.65.ckpt
 device: 0
 
 
-log_dir: /home/hk-project-sustainebot/ft4740/code/flower_vla_calvin/logs/
-dataset_path: /home/hk-project-robolear/ft4740/code/calvin_d_old/dataset/task_D_D
-num_videos: 30
+log_dir: /output/logs/eval/calvin/abc_d/
+dataset_path: /data/fywang/Calvin/task_D_D
+num_videos: 0
 debug: False
 
-log_wandb: True
+log_wandb: False
 wandb_entity: bennoq
 
 num_sequences: 100
