@@ -38,10 +38,16 @@ from flower.models.networks.pre_vlm_selector import (
     PreVLMVisionSelector,
 )
 from flower.utils.lr_schedulers.tri_stage_scheduler import TriStageLRScheduler
+from flower.utils.profiler import FlowerProfiler
 from flower.callbacks.ema import EMA
 from flower.models.utils import ActionIndex, generate_policy_prompt
 
 logger = logging.getLogger(__name__)
+
+# Type alias for optional profiler
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from flower.utils.profiler import FlowerProfiler
 
 
 class FLOWERVLA(pl.LightningModule):
@@ -93,6 +99,11 @@ class FLOWERVLA(pl.LightningModule):
         pre_vlm_max_value: float = 3.0,
         pre_vlm_noise_start: float = 1.0,
         pre_vlm_noise_end: float = 0.01,
+        pre_vlm_select_text_tokens: bool = False,
+        pre_vlm_text_keep_mass: float = 0.9,
+        pre_vlm_text_keep_first: int = 8,
+        pre_vlm_text_min_tokens: int = 8,
+        pre_vlm_text_max_tokens: int = 32,
 
         # DiT Configuration
         sampling_type: str = 'ln',
@@ -196,6 +207,10 @@ class FLOWERVLA(pl.LightningModule):
         self.rollout_step_counter = 0
         self.pred_action_seq = None
         self.modality_scope = "lang"
+
+        # Profiler (optional, set via set_profiler())
+        self.profiler: Optional[FlowerProfiler] = None
+
         # Save optimizer config
         self.optimizer_config = optimizer
         self.lr_scheduler_config = lr_scheduler
@@ -674,81 +689,171 @@ class FLOWERVLA(pl.LightningModule):
         dt = 1.0 / steps
         dt_tensor = torch.tensor([dt] * b, device=device).view([b] + [1]*(z.dim()-1))
 
+        # Precompute time-invariant conditioning once (not every DiT step)
+        precomputed = self._prepare_dit_cond(cond)
+
+        # Profile DiT sampling total
+        if self.profiler is not None:
+            import time
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dit_start = time.perf_counter()
+
         for i in range(steps, 0, -1):
             t_val = i / steps
             t_tensor = torch.full((b,), t_val, device=device)
 
-            # Predict velocity field
-            vc = self.dit_forward(z, t_tensor, cond)
+            # Predict velocity field (using precomputed conditioning)
+            vc = self.dit_forward(z, t_tensor, cond, precomputed=precomputed)
             z = z - dt_tensor * vc
+
+        if self.profiler is not None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            dit_total_ms = (time.perf_counter() - dit_start) * 1000
+            self.profiler.record_metric("dit_sampling_total", dit_total_ms, "timings")
+            self.profiler.record_metric("dit_per_step_avg", dit_total_ms / steps, "timings")
 
         return z.clamp(-1, 1)
 
-    def dit_forward(self, z: torch.Tensor, t: torch.Tensor, cond_dict: dict) -> torch.Tensor:
+    def _prepare_dit_cond(self, cond_dict: dict) -> dict:
         """
-        Forward pass through the DiT blocks.
+        Precompute time-invariant conditioning for DiT forward passes.
+        Called once before the sampling loop to avoid redundant computation.
         """
         default_dtype = next(self.parameters()).dtype
-        B, t_seq, d = z.shape
 
         # Get conditioning information
         cond = cond_dict['features'].to(default_dtype)
         frequency_embeds = cond_dict['frequency_embeds'].squeeze(1).to(default_dtype)
         action_type = cond_dict['action_type'].to(self.device)
 
-        # Encode actions
+        # Project VL features to DiT dimension - Profile VL projection
+        if self.profiler is not None:
+            with self.profiler.profile("vl_projection"):
+                cond_projected = self.cond_linear(self.cond_norm(cond))
+        else:
+            cond_projected = self.cond_linear(self.cond_norm(cond))
+
+        # === Proprio-Guided VL Selection ===
+        if self.use_proprio_vl_selection:
+            # Encode proprio if encoder exists
+            if self.proprio_encoder is not None:
+                if cond_dict.get('proprio_history') is None:
+                    raise ValueError(
+                        f"vl_selection_mode='{self.vl_selection_mode}' requires proprio_history in batch."
+                    )
+                proprio_history = cond_dict['proprio_history'].to(default_dtype)
+                proprio_tokens = self.proprio_encoder(proprio_history)
+            else:
+                proprio_tokens = None
+
+            # Select VL tokens
+            if self.profiler is not None:
+                with self.profiler.profile("post_vlm_selection"):
+                    context = self.vl_selector(proprio_tokens, cond_projected)
+            else:
+                context = self.vl_selector(proprio_tokens, cond_projected)
+
+            if self.profiler is not None:
+                self.profiler.record_tokens("vl_tokens_after_post_vlm", context.shape[1])
+        else:
+            context = cond_projected if self.use_cross_attn else None
+
+        # Precompute vlm_token for adaln
+        if self.use_adaln_cond:
+            vlm_token = cond_projected[:, 0, :] if self.use_readout_token else cond_projected.mean(dim=1)
+        else:
+            vlm_token = None
+
+        return {
+            'cond_projected': cond_projected,
+            'frequency_embeds': frequency_embeds,
+            'action_type': action_type,
+            'context': context,
+            'vlm_token': vlm_token,
+        }
+
+    def dit_forward(self, z: torch.Tensor, t: torch.Tensor, cond_dict: dict, precomputed: dict = None) -> torch.Tensor:
+        """
+        Forward pass through the DiT blocks.
+
+        Args:
+            z: Noisy action tensor
+            t: Time step tensor
+            cond_dict: Conditioning dictionary (used if precomputed is None)
+            precomputed: Precomputed time-invariant conditioning from _prepare_dit_cond
+        """
+        default_dtype = next(self.parameters()).dtype
+        B, t_seq, d = z.shape
+
+        # Use precomputed values if available, otherwise compute them
+        if precomputed is not None:
+            cond = precomputed['cond_projected']
+            frequency_embeds = precomputed['frequency_embeds']
+            action_type = precomputed['action_type']
+            context = precomputed['context']
+            vlm_token = precomputed['vlm_token']
+        else:
+            # Fallback: compute everything (for training or when not using sample_actions)
+            cond = cond_dict['features'].to(default_dtype)
+            frequency_embeds = cond_dict['frequency_embeds'].squeeze(1).to(default_dtype)
+            action_type = cond_dict['action_type'].to(self.device)
+
+            # Project VL features
+            if self.profiler is not None:
+                with self.profiler.profile("vl_projection"):
+                    cond = self.cond_linear(self.cond_norm(cond))
+            else:
+                cond = self.cond_linear(self.cond_norm(cond))
+
+            # VL Selection
+            if self.use_proprio_vl_selection:
+                if self.proprio_encoder is not None:
+                    if cond_dict.get('proprio_history') is None:
+                        raise ValueError(
+                            f"vl_selection_mode='{self.vl_selection_mode}' requires proprio_history in batch."
+                        )
+                    proprio_history = cond_dict['proprio_history'].to(default_dtype)
+                    proprio_tokens = self.proprio_encoder(proprio_history)
+                else:
+                    proprio_tokens = None
+
+                if self.profiler is not None:
+                    with self.profiler.profile("post_vlm_selection"):
+                        context = self.vl_selector(proprio_tokens, cond)
+                else:
+                    context = self.vl_selector(proprio_tokens, cond)
+
+                if self.profiler is not None:
+                    self.profiler.record_tokens("vl_tokens_after_post_vlm", context.shape[1])
+            else:
+                context = cond if self.use_cross_attn else None
+
+            # Compute vlm_token
+            if self.use_adaln_cond:
+                vlm_token = cond[:, 0, :] if self.use_readout_token else cond.mean(dim=1)
+            else:
+                vlm_token = None
+
+        # Encode actions (depends on z, so always computed)
         z, valid_dims = self.encode_actions(z, action_type)
 
         # Add positional encoding if not using ROPE/NOPE
         if not self.use_rope and not self.use_nope:
             z = z + self.positional_encoding
 
-        # Process embeddings
+        # Time embedding (time-dependent, always computed)
         t_emb = stateless_norm(self.t_embedder(t)) + \
                 stateless_norm(frequency_embeds).squeeze(1)
 
-        # Project VL features to DiT dimension
-        cond = self.cond_linear(self.cond_norm(cond))
-
-        # === Proprio-Guided VL Selection ===
-        if self.use_proprio_vl_selection:
-            # Encode proprio if encoder exists (proprio-based modes)
-            if self.proprio_encoder is not None:
-                # These modes need proprio_history
-                if cond_dict.get('proprio_history') is None:
-                    raise ValueError(
-                        f"vl_selection_mode='{self.vl_selection_mode}' requires proprio_history in batch, "
-                        f"but it was not provided."
-                    )
-                proprio_history = cond_dict['proprio_history'].to(default_dtype)
-                proprio_tokens = self.proprio_encoder(proprio_history)  # [B, H, dit_dim]
-            else:
-                # Modes that don't use proprio (random, mean_pool, max_pool)
-                proprio_tokens = None
-
-            # Select VL tokens using the configured mode
-            context = self.vl_selector(proprio_tokens, cond)
-
-            # Log compression ratio on first call
-            if not hasattr(self, '_vl_selection_forward_logged'):
-                logger.info(
-                    f"[ProprioVLSelection] mode='{self.vl_selection_mode}' | "
-                    f"VL tokens: {cond.shape[1]} -> Selected: {context.shape[1]} "
-                    f"(compression: {cond.shape[1] / context.shape[1]:.1f}x)"
-                )
-                self._vl_selection_forward_logged = True
-        else:
-            # Default: use all VL tokens
-            context = cond if self.use_cross_attn else None
-
-        # Set up global conditioning
+        # Set up global conditioning (time-dependent)
         if self.use_adaln_cond:
-            vlm_token = cond[:, 0, :] if self.use_readout_token else cond.mean(dim=1)
             global_cond = vlm_token + t_emb
         else:
             global_cond = t_emb
 
-        # Get adaln signals
+        # Get adaln signals (time-dependent)
         if not self.action_type_adaln:
             global_adaln = self.adaln(global_cond)
         else:
@@ -821,26 +926,61 @@ class FLOWERVLA(pl.LightningModule):
 
         # Extract visual features
         last_image = image_tensor[:, -1, :, :, :]
-        image_features = self.vlm._encode_image(
-            last_image.view(-1, C, H, W).to(device).to(default_type)
-        ).to(default_type)
+
+        # Profile vision encoder
+        if self.profiler is not None:
+            with self.profiler.profile("vision_encoder"):
+                image_features = self.vlm._encode_image(
+                    last_image.view(-1, C, H, W).to(device).to(default_type)
+                ).to(default_type)
+        else:
+            image_features = self.vlm._encode_image(
+                last_image.view(-1, C, H, W).to(device).to(default_type)
+            ).to(default_type)
+
         image_features = image_features.view(B, 1 * image_features.shape[1], -1)
+
+        # Record raw vision token count
+        if self.profiler is not None:
+            self.profiler.record_tokens("vision_tokens_raw", image_features.shape[1])
 
         # Process second view if enabled
         if self.use_second_view:
             image2_tensor = batch["rgb_obs"]['rgb_gripper']
             last_image2 = image2_tensor[:, -1, :, :, :]
-            image2_features = self.vlm._encode_image(
-                last_image2.view(-1, C, H, W).to(device).to(default_type)
-            ).to(default_type)
+            if self.profiler is not None:
+                with self.profiler.profile("vision_encoder"):
+                    image2_features = self.vlm._encode_image(
+                        last_image2.view(-1, C, H, W).to(device).to(default_type)
+                    ).to(default_type)
+            else:
+                image2_features = self.vlm._encode_image(
+                    last_image2.view(-1, C, H, W).to(device).to(default_type)
+                ).to(default_type)
             image2_features = image2_features.view(B, 1 * image2_features.shape[1], -1)
             image_features = torch.cat([image_features, image2_features], dim=1)
 
+            # Update raw vision token count for second view
+            if self.profiler is not None:
+                self.profiler.record_tokens("vision_tokens_raw", image_features.shape[1])
+
         # Get text embeddings (needed for VLM encoder and potentially pre-VLM selection)
-        constructed_prompts = self.construct_prompts(batch)
-        text_embeds, text_attention_mask = self._get_text_embeddings(
-            constructed_prompts, device
-        )
+        # Profile text embedding
+        if self.profiler is not None:
+            with self.profiler.profile("text_embed"):
+                constructed_prompts = self.construct_prompts(batch)
+                text_embeds, text_attention_mask = self._get_text_embeddings(
+                    constructed_prompts, device
+                )
+        else:
+            constructed_prompts = self.construct_prompts(batch)
+            text_embeds, text_attention_mask = self._get_text_embeddings(
+                constructed_prompts, device
+            )
+
+        # Record text token count
+        if self.profiler is not None:
+            self.profiler.record_tokens("text_tokens", text_embeds.shape[1])
 
         # === Pre-VLM Vision Token Selection (LightVLA-style) ===
         # Select vision tokens BEFORE they enter the VLM encoder
@@ -884,13 +1024,28 @@ class FLOWERVLA(pl.LightningModule):
                 )
                 query_attention_mask = torch.cat([text_attention_mask, proprio_query_mask], dim=1)
 
-            image_features, vision_attention_mask = self.pre_vlm_selector(
-                image_features,
-                proprio_embeds=proprio_embeds,
-                text_embeds=selection_text_embeds,
-                query_attention_mask=query_attention_mask,
-                return_mask=True,
-            )
+            # Profile pre-VLM selection
+            if self.profiler is not None:
+                with self.profiler.profile("pre_vlm_selection"):
+                    image_features, vision_attention_mask = self.pre_vlm_selector(
+                        image_features,
+                        proprio_embeds=proprio_embeds,
+                        text_embeds=selection_text_embeds,
+                        query_attention_mask=query_attention_mask,
+                        return_mask=True,
+                    )
+            else:
+                image_features, vision_attention_mask = self.pre_vlm_selector(
+                    image_features,
+                    proprio_embeds=proprio_embeds,
+                    text_embeds=selection_text_embeds,
+                    query_attention_mask=query_attention_mask,
+                    return_mask=True,
+                )
+
+            # Record vision tokens after pre-VLM selection
+            if self.profiler is not None:
+                self.profiler.record_tokens("vision_tokens_after_pre_vlm", image_features.shape[1])
 
             if not hasattr(self, '_pre_vlm_selection_logged'):
                 log_parts = [f"[PreVLMSelection] mode={selection_mode}"]
@@ -976,11 +1131,22 @@ class FLOWERVLA(pl.LightningModule):
                 dim=1,
             )
 
-        # Process through encoder
-        features = self.vlm.get_encoder()(
-            inputs_embeds=merged_embeds,
-            attention_mask=attention_mask
-        ).last_hidden_state
+        # Process through encoder - Profile VLM encoder
+        if self.profiler is not None:
+            with self.profiler.profile("vlm_encoder"):
+                features = self.vlm.get_encoder()(
+                    inputs_embeds=merged_embeds,
+                    attention_mask=attention_mask
+                ).last_hidden_state
+        else:
+            features = self.vlm.get_encoder()(
+                inputs_embeds=merged_embeds,
+                attention_mask=attention_mask
+            ).last_hidden_state
+
+        # Record VL tokens after VLM
+        if self.profiler is not None:
+            self.profiler.record_tokens("vl_tokens_after_vlm", features.shape[1])
 
         # Apply dropout
         features = self.vlm_token_dropout(features)
@@ -1053,6 +1219,10 @@ class FLOWERVLA(pl.LightningModule):
         Returns:
             Predicted action sequence
         """
+        # Start profiling step
+        if self.profiler is not None:
+            self.profiler.start_step()
+
         # batch = {'rgb_obs': obs, '"lang_text"': goal}
         rgb_static = obs["rgb_obs"]['rgb_static']
         rgb_gripper = obs["rgb_obs"]['rgb_gripper']
@@ -1105,7 +1275,13 @@ class FLOWERVLA(pl.LightningModule):
         )
 
         # Sample actions
-        return self.sample_actions(noise, features, inference=True)
+        actions = self.sample_actions(noise, features, inference=True)
+
+        # End profiling step
+        if self.profiler is not None:
+            self.profiler.end_step()
+
+        return actions
 
     def step(self, obs: Dict, goal: Dict) -> torch.Tensor:
         """
@@ -1149,6 +1325,17 @@ class FLOWERVLA(pl.LightningModule):
         # Reset log flags for new sequence
         if hasattr(self, '_proprio_buffer_logged'):
             delattr(self, '_proprio_buffer_logged')
+
+    def set_profiler(self, profiler: Optional["FlowerProfiler"]) -> None:
+        """
+        Attach a profiler for performance measurement.
+
+        Args:
+            profiler: FlowerProfiler instance or None to disable
+        """
+        self.profiler = profiler
+        if profiler is not None:
+            logger.info("[FLOWERVLA] Profiler attached")
 
     def on_train_start(self):
         """Convert model to appropriate dtype on training start."""

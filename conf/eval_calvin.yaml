@@ -27,3 +27,7 @@ num_sequences: 100
 ep_len: 360
 num_sampling_steps: 4
 multistep: 10
+
+# Profiling configuration
+enable_profiling: true
+profiling_warmup_steps: 5

@@ -16,11 +16,13 @@ from pytorch_lightning import seed_everything
 from termcolor import colored
 from tqdm.auto import tqdm
 import wandb
+import torch
 import torch.distributed as dist
 
 from flower.evaluation.multistep_sequences import get_sequences
 from flower.evaluation.utils import get_default_mode_and_env, get_env_state_for_initial_condition, join_vis_lang
 from flower.rollout.rollout_video import RolloutVideo
+from flower.utils.profiler import FlowerProfiler
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +94,8 @@ def print_and_save(total_results, plan_dicts, cfg, log_dir=None):
             print(f"{task}: {cnt_success[task]} / {total[task]} |  SR: {cnt_success[task] / total[task] * 100:.1f}%")
 
         data = {"avg_seq_len": avg_seq_len, "chain_sr": chain_sr, "task_info": task_info}
-        wandb.log({"avrg_performance/avg_seq_len": avg_seq_len, "avrg_performance/chain_sr": chain_sr, "detailed_metrics/task_info": task_info})
+        if cfg.log_wandb:
+            wandb.log({"avrg_performance/avg_seq_len": avg_seq_len, "avrg_performance/chain_sr": chain_sr, "detailed_metrics/task_info": task_info})
         current_data[epoch] = data
 
         print()
@@ -195,24 +198,25 @@ def rollout(env, model, task_oracle, cfg, subtask, lang_embeddings, val_annotati
     model.reset()
     start_info = env.get_info()
 
-    for step in range(cfg.ep_len):
-        action = model.step(obs, goal)
-        obs, _, _, current_info = env.step(action)
-        if cfg.debug:
-            img = env.render(mode="rgb_array")
-            join_vis_lang(img, lang_annotation)
-            # time.sleep(0.1)
-        if record:
-            # update video
-            rollout_video.update(obs["rgb_obs"]["rgb_static"])
-        # check if current step solves a task
-        current_task_info = task_oracle.get_task_info_for_set(start_info, current_info, {subtask})
-        if len(current_task_info) > 0:
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for step in range(cfg.ep_len):
+            action = model.step(obs, goal)
+            obs, _, _, current_info = env.step(action)
             if cfg.debug:
-                print(colored("success", "green"), end=" ")
+                img = env.render(mode="rgb_array")
+                join_vis_lang(img, lang_annotation)
+                # time.sleep(0.1)
             if record:
-                rollout_video.add_language_instruction(lang_annotation)
-            return True
+                # update video
+                rollout_video.update(obs["rgb_obs"]["rgb_static"])
+            # check if current step solves a task
+            current_task_info = task_oracle.get_task_info_for_set(start_info, current_info, {subtask})
+            if len(current_task_info) > 0:
+                if cfg.debug:
+                    print(colored("success", "green"), end=" ")
+                if record:
+                    rollout_video.add_language_instruction(lang_annotation)
+                return True
     if cfg.debug:
         print(colored("fail", "red"), end=" ")
     if record:
@@ -224,7 +228,7 @@ def rollout(env, model, task_oracle, cfg, subtask, lang_embeddings, val_annotati
 def main(cfg):
     log_wandb = cfg.log_wandb
     # torch.cuda.set_device(cfg.device)
-    seed_everything(0, workers=True) 
+    seed_everything(0, workers=True)
     lang_embeddings = None
     env = None
     results = {}
@@ -243,6 +247,17 @@ def main(cfg):
 
     model = model.to(cfg.device)
 
+    # Convert model to BF16 to reduce VRAM by ~2x
+    # (Model is loaded in FP32, autocast only affects computation not storage)
+    model = model.to(torch.bfloat16)
+    torch.cuda.empty_cache()  # Reclaim memory from FP32 weights
+
+    # Log VRAM usage after optimization
+    if torch.cuda.is_available():
+        allocated_gb = torch.cuda.memory_allocated() / 1024**3
+        reserved_gb = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"[VRAM] After BF16 conversion: {allocated_gb:.2f} GB allocated, {reserved_gb:.2f} GB reserved")
+
     if cfg.num_sampling_steps is not None:
         model.num_sampling_steps = cfg.num_sampling_steps
     if cfg.multistep is not None:
@@ -250,6 +265,21 @@ def main(cfg):
     print(model.num_sampling_steps, model.multistep)
 
     model.eval()
+
+    # Initialize profiler if enabled
+    profiler = None
+    enable_profiling = getattr(cfg, 'enable_profiling', False)
+    if enable_profiling:
+        warmup_steps = getattr(cfg, 'profiling_warmup_steps', 5)
+        action_chunk_size = getattr(model, 'multistep', 1) or 1
+        profiler = FlowerProfiler(
+            warmup_steps=warmup_steps,
+            enabled=True,
+            log_to_wandb=log_wandb,
+            action_chunk_size=action_chunk_size,
+        )
+        model.set_profiler(profiler)
+        logger.info(f"[Profiler] Initialized with {warmup_steps} warmup steps, action_chunk_size={action_chunk_size}")
 
     log_dir = get_log_dir(cfg.log_dir)
     if log_wandb:
@@ -264,7 +294,14 @@ def main(cfg):
 
     results[Path(cfg.checkpoint)], plans[Path(cfg.checkpoint)] = evaluate_policy(model, env, lang_embeddings, cfg, num_videos=cfg.num_videos, save_dir=Path(log_dir))
     print_and_save(results, plans, cfg, log_dir=log_dir)
-    
+
+    # Generate and save profiling report if enabled
+    if profiler is not None:
+        profiler.print_report()
+        profiler.save_report(log_dir / "profiling_report.json")
+        if log_wandb:
+            profiler.log_to_wandb_summary()
+
     if log_wandb:
         run.finish()
 
