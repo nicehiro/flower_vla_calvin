@@ -31,3 +31,8 @@ multistep: 10
 # Profiling configuration
 enable_profiling: true
 profiling_warmup_steps: 5
+
+# Attention visualization configuration
+visualize_attention: false
+attention_alpha: 0.4
+attention_fps: 30

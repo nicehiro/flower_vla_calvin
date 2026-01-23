@@ -91,6 +91,7 @@ class FlowerProfiler:
         # Step tracking
         self.total_steps = 0
         self.profiled_steps = 0
+        self.total_simulation_steps = 0  # Tracks actual env steps (for avg latency calc)
 
         # Current step state
         self._current_step: Optional[ProfilerMetrics] = None
@@ -107,6 +108,17 @@ class FlowerProfiler:
     def is_warmup(self) -> bool:
         """Check if we're still in warmup phase."""
         return self.total_steps < self.warmup_steps
+
+    def record_simulation_step(self) -> None:
+        """
+        Record a simulation step (called every env.step).
+
+        This tracks actual environment steps, which may differ from forward passes
+        due to action chunking. Used to compute average latency per simulation step.
+        """
+        if not self.enabled or self.is_warmup:
+            return
+        self.total_simulation_steps += 1
 
     def start_step(self) -> None:
         """Start profiling a new step."""
@@ -291,6 +303,21 @@ class FlowerProfiler:
                 report["derived"]["effective_action_hz"] = forward_pass_hz * self.action_chunk_size
                 report["derived"]["action_chunk_size"] = self.action_chunk_size
 
+        # Average latency per simulation step
+        if "step_total" in report["timings"] and self.total_simulation_steps > 0:
+            total_latency_ms = sum(m.timings.get("step_total", 0) for m in self._all_metrics)
+            avg_step_latency_ms = total_latency_ms / self.total_simulation_steps
+            report["derived"]["avg_step_latency_ms"] = avg_step_latency_ms
+            report["derived"]["total_simulation_steps"] = self.total_simulation_steps
+            report["derived"]["total_forward_passes"] = self.profiled_steps
+            report["derived"]["total_model_latency_ms"] = total_latency_ms
+
+            # Latency breakdown per simulation step (each component / total_simulation_steps)
+            report["step_latency_breakdown"] = {}
+            for key in report["timings"]:
+                total_component_ms = sum(m.timings.get(key, 0) for m in self._all_metrics)
+                report["step_latency_breakdown"][key] = total_component_ms / self.total_simulation_steps
+
         # Compression ratios
         if "vision_tokens_raw" in report["tokens"] and "vision_tokens_after_pre_vlm" in report["tokens"]:
             raw = report["tokens"]["vision_tokens_raw"]["mean"]
@@ -364,6 +391,36 @@ class FlowerProfiler:
                 if key not in printed:
                     print(f"  {key:30s}: {stats['mean']:8.2f} +/- {stats['std']:6.2f}")
 
+        # Step latency breakdown (per simulation step, accounting for action chunking)
+        if report.get("step_latency_breakdown"):
+            print("\nStep Latency Breakdown (ms per simulation step):")
+            print("-" * 40)
+
+            # Use same preferred order
+            timing_order = [
+                "vision_encoder",
+                "text_embed",
+                "pre_vlm_selection",
+                "vlm_encoder",
+                "vl_projection",
+                "post_vlm_selection",
+                "dit_sampling_total",
+                "dit_per_step_avg",
+                "action_decode",
+                "step_total",
+            ]
+
+            breakdown = report["step_latency_breakdown"]
+            printed = set()
+            for key in timing_order:
+                if key in breakdown:
+                    print(f"  {key:30s}: {breakdown[key]:8.3f}")
+                    printed.add(key)
+
+            for key, value in breakdown.items():
+                if key not in printed:
+                    print(f"  {key:30s}: {value:8.3f}")
+
         # Token counts
         if report["tokens"]:
             print("\nToken Counts:")
@@ -404,6 +461,12 @@ class FlowerProfiler:
             if "effective_action_hz" in report["derived"]:
                 chunk_size = report["derived"].get("action_chunk_size", 1)
                 print(f"  {'Effective Action Rate':30s}: {report['derived']['effective_action_hz']:8.1f} Hz (chunk={chunk_size})")
+            if "avg_step_latency_ms" in report["derived"]:
+                sim_steps = report["derived"].get("total_simulation_steps", 0)
+                fwd_passes = report["derived"].get("total_forward_passes", 0)
+                print(f"  {'Avg Step Latency':30s}: {report['derived']['avg_step_latency_ms']:8.3f} ms")
+                print(f"  {'Total Simulation Steps':30s}: {sim_steps:8d}")
+                print(f"  {'Total Forward Passes':30s}: {fwd_passes:8d}")
             if "pre_vlm_compression_ratio" in report["derived"]:
                 print(f"  {'Pre-VLM Compression':30s}: {report['derived']['pre_vlm_compression_ratio']:8.1f}x")
             if "post_vlm_compression_ratio" in report["derived"]:
@@ -459,6 +522,7 @@ class FlowerProfiler:
         """Reset all profiling state."""
         self.total_steps = 0
         self.profiled_steps = 0
+        self.total_simulation_steps = 0
         self._current_step = None
         self._step_start_time = None
         self._active_timers = {}

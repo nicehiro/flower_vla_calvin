@@ -1027,20 +1027,22 @@ class FLOWERVLA(pl.LightningModule):
             # Profile pre-VLM selection
             if self.profiler is not None:
                 with self.profiler.profile("pre_vlm_selection"):
-                    image_features, vision_attention_mask = self.pre_vlm_selector(
+                    image_features, selection_counts, vision_attention_mask = self.pre_vlm_selector(
                         image_features,
                         proprio_embeds=proprio_embeds,
                         text_embeds=selection_text_embeds,
                         query_attention_mask=query_attention_mask,
                         return_mask=True,
+                        return_scores=True,
                     )
             else:
-                image_features, vision_attention_mask = self.pre_vlm_selector(
+                image_features, selection_counts, vision_attention_mask = self.pre_vlm_selector(
                     image_features,
                     proprio_embeds=proprio_embeds,
                     text_embeds=selection_text_embeds,
                     query_attention_mask=query_attention_mask,
                     return_mask=True,
+                    return_scores=True,
                 )
 
             # Record vision tokens after pre-VLM selection
@@ -1306,6 +1308,10 @@ class FLOWERVLA(pl.LightningModule):
             # Return whole chunk for ALOHA setups
             current_action = self.pred_action_seq
 
+        # Record simulation step for profiling (tracks actual env steps)
+        if self.profiler is not None:
+            self.profiler.record_simulation_step()
+
         self.rollout_step_counter += 1
         if self.rollout_step_counter == self.multistep:
             self.rollout_step_counter = 0
@@ -1325,6 +1331,20 @@ class FLOWERVLA(pl.LightningModule):
         # Reset log flags for new sequence
         if hasattr(self, '_proprio_buffer_logged'):
             delattr(self, '_proprio_buffer_logged')
+
+    def get_attention_visualization_data(self) -> Optional[dict]:
+        """Get attention weights for visualization. Call after forward().
+
+        Returns None if pre-VLM selection is not enabled or no data available.
+
+        Returns a dictionary with:
+        - selection_counts: [B, V] normalized selection histogram (how many times each token was selected)
+        - num_selected: number of tokens selected
+        - num_total: total number of vision tokens
+        """
+        if not self.use_pre_vlm_selection or self.pre_vlm_selector is None:
+            return None
+        return self.pre_vlm_selector.get_visualization_data()
 
     def set_profiler(self, profiler: Optional["FlowerProfiler"]) -> None:
         """

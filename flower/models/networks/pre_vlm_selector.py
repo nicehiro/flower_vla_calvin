@@ -134,6 +134,9 @@ class PreVLMVisionSelector(nn.Module):
         self._logged_compression = False
         self._step_counter = 0
         self._diagnostics = {}
+        self._last_selection_counts = None  # Cache for visualization (normalized selection histogram)
+        self._last_hard_mask = None  # Binary mask for visualization (exactly which tokens were selected)
+        self._last_soft_weights = None  # Soft attention weights for smooth heatmap visualization
 
         logger.info(
             f"[PreVLMVisionSelector] mode={selection_mode}, residual={use_residual}"
@@ -150,6 +153,26 @@ class PreVLMVisionSelector(nn.Module):
         # Cosine annealing: starts at noise_start, ends at noise_end
         cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
         return self.gumbel_noise_end + (self.gumbel_noise_start - self.gumbel_noise_end) * cosine_decay
+
+    def get_visualization_data(self) -> dict:
+        """Return data for attention visualization (call after forward).
+
+        Returns a dictionary with:
+        - soft_weights: [B, V] continuous attention weights for smooth heatmap visualization
+        - selection_mask: [B, V] binary mask (True = token was selected)
+        - selection_counts: [B, V] normalized selection histogram (how many times each token was selected)
+        - num_selected: number of tokens selected
+        - num_total: total number of vision tokens
+        - compression_ratio: num_selected / num_total
+        """
+        return {
+            "soft_weights": self._last_soft_weights,  # Continuous weights [B, V]
+            "selection_mask": self._last_hard_mask,  # Binary mask [B, V]
+            "selection_counts": self._last_selection_counts,  # Keep for debugging
+            "num_selected": getattr(self, "_last_num_selected", 0),
+            "num_total": getattr(self, "_last_num_total", 0),
+            "compression_ratio": getattr(self, "_last_compression_ratio", 1.0),
+        }
 
     def _compute_diagnostics(
         self,
@@ -316,11 +339,10 @@ class PreVLMVisionSelector(nn.Module):
         # Score = Q @ H_v^T / √D (against normalized vision, not original!)
         scores = torch.einsum('bqd,bkd->bqk', queries, vision_normed) / (D ** 0.5)
 
-        vis_soft_indicator = None
-        if return_scores:
-            # Visualization importance (no noise): expected selection histogram under softmax relaxation.
-            # Shape: [B, V]
-            vis_soft_indicator = F.softmax(scores, dim=-1).sum(dim=1) / V
+        # Store soft attention weights for visualization (average distribution across queries)
+        # Softmax per query creates distribution, sum and normalize gives expected selection probability
+        # self._last_soft_weights = F.softmax(scores, dim=-1).sum(dim=1) / scores.shape[1]  # [B, V]
+        self._last_soft_weights = F.softmax(scores.sum(dim=1), dim=-1)  # [B, V]
 
         if self.training:
             noise_scale = self.current_noise_scale
@@ -359,7 +381,6 @@ class PreVLMVisionSelector(nn.Module):
                 )
                 num_selected = 1
 
-            soft_weights = None
         else:
             hard_indices = scores.argmax(dim=-1)
             device = vision_tokens.device
@@ -383,11 +404,16 @@ class PreVLMVisionSelector(nn.Module):
                 )
                 num_selected = 1
 
-            soft_weights = None
-
         self._last_num_selected = num_selected
         self._last_num_total = V
         self._last_compression_ratio = num_selected / V
+
+        # Store normalized selection counts for visualization (how many queries selected each token)
+        # selection_counts: [B, V] - higher count = more queries selected this token
+        max_count = selection_counts.max().clamp(min=1)
+        self._last_selection_counts = selection_counts.float() / max_count
+        # Store binary mask for crisp visualization (exactly which tokens were selected)
+        self._last_hard_mask = hard_mask
 
         if self.training:
             self._step_counter += 1
@@ -420,13 +446,10 @@ class PreVLMVisionSelector(nn.Module):
             )
 
         if return_scores:
-            if vis_soft_indicator is None:
-                raise RuntimeError("vis_soft_indicator is required when return_scores=True")
-            soft_weights = vis_soft_indicator
-
+            # Return normalized selection counts for visualization
             if return_mask:
-                return selected_tokens, soft_weights, selected_attention_mask
-            return selected_tokens, soft_weights
+                return selected_tokens, self._last_selection_counts, selected_attention_mask
+            return selected_tokens, self._last_selection_counts
 
         if return_mask:
             return selected_tokens, selected_attention_mask

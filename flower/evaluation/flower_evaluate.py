@@ -23,6 +23,7 @@ from flower.evaluation.multistep_sequences import get_sequences
 from flower.evaluation.utils import get_default_mode_and_env, get_env_state_for_initial_condition, join_vis_lang
 from flower.rollout.rollout_video import RolloutVideo
 from flower.utils.profiler import FlowerProfiler
+from flower.utils.attention_visualization import AttentionVisualizer
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,17 @@ def evaluate_policy(model, env, lang_embeddings, cfg, num_videos=0, save_dir=Non
     else:
         rollout_video = None
 
+    # Initialize attention visualizer if enabled
+    attn_visualizer = None
+    if getattr(cfg, "visualize_attention", False):
+        attn_vis_dir = Path(save_dir) / "attention_vis" if save_dir else Path("attention_vis")
+        attn_visualizer = AttentionVisualizer(
+            save_dir=attn_vis_dir,
+            alpha=getattr(cfg, "attention_alpha", 0.4),
+            fps=getattr(cfg, "attention_fps", 30),
+        )
+        logger.info(f"[AttentionVisualizer] Enabled, saving to {attn_vis_dir}")
+
     eval_sequences = get_sequences(cfg.num_sequences)
 
     results = []
@@ -137,10 +149,21 @@ def evaluate_policy(model, env, lang_embeddings, cfg, num_videos=0, save_dir=Non
 
     for i, (initial_state, eval_sequence) in enumerate(eval_sequences):
         record = i < num_videos
+
+        # Start attention visualization for this sequence
+        if attn_visualizer is not None:
+            attn_visualizer.start_sequence(i)
+
         result = evaluate_sequence(
-            env, model, task_oracle, initial_state, eval_sequence, lang_embeddings, val_annotations, cfg, record, rollout_video, i
+            env, model, task_oracle, initial_state, eval_sequence, lang_embeddings,
+            val_annotations, cfg, record, rollout_video, i, attn_visualizer
         )
         results.append(result)
+
+        # Finish attention visualization for this sequence
+        if attn_visualizer is not None:
+            attn_visualizer.finish_sequence()
+
         if record:
             rollout_video.write_to_tmp()
         if not cfg.debug:
@@ -157,7 +180,8 @@ def evaluate_policy(model, env, lang_embeddings, cfg, num_videos=0, save_dir=Non
 
 
 def evaluate_sequence(
-    env, model, task_checker, initial_state, eval_sequence, lang_embeddings, val_annotations, cfg, record, rollout_video, i
+    env, model, task_checker, initial_state, eval_sequence, lang_embeddings,
+    val_annotations, cfg, record, rollout_video, i, attn_visualizer=None
 ):
     robot_obs, scene_obs = get_env_state_for_initial_condition(initial_state)
     env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
@@ -171,10 +195,23 @@ def evaluate_sequence(
         print()
         print(f"Evaluating sequence: {' -> '.join(eval_sequence)}")
         print("Subtask: ", end="")
-    for subtask in eval_sequence:
+    for subtask_idx, subtask in enumerate(eval_sequence):
         if record:
             rollout_video.new_subtask()
-        success = rollout(env, model, task_checker, cfg, subtask, lang_embeddings, val_annotations, record, rollout_video)
+
+        # Start attention visualization for this subtask
+        if attn_visualizer is not None:
+            attn_visualizer.start_subtask(subtask_idx, subtask)
+
+        success = rollout(
+            env, model, task_checker, cfg, subtask, lang_embeddings,
+            val_annotations, record, rollout_video, attn_visualizer
+        )
+
+        # Finish attention visualization for this subtask
+        if attn_visualizer is not None:
+            attn_visualizer.finish_subtask(success)
+
         if record:
             rollout_video.draw_outcome(success)
         if success:
@@ -184,7 +221,8 @@ def evaluate_sequence(
     return success_counter
 
 
-def rollout(env, model, task_oracle, cfg, subtask, lang_embeddings, val_annotations, record=False, rollout_video=None):
+def rollout(env, model, task_oracle, cfg, subtask, lang_embeddings, val_annotations,
+             record=False, rollout_video=None, attn_visualizer=None):
     if cfg.debug:
         print(f"{subtask} ", end="")
         time.sleep(0.5)
@@ -198,9 +236,83 @@ def rollout(env, model, task_oracle, cfg, subtask, lang_embeddings, val_annotati
     model.reset()
     start_info = env.get_info()
 
+    # Track last attention data for intermediate frames
+    last_attn_data = None
+
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for step in range(cfg.ep_len):
+            # Check if this is a policy step (model will be called)
+            is_policy_step = (model.rollout_step_counter % model.multistep == 0)
+
             action = model.step(obs, goal)
+
+            # Get attention data on policy steps
+            if is_policy_step:
+                last_attn_data = model.get_attention_visualization_data()
+
+            # Add frame to attention visualizer
+            if attn_visualizer is not None:
+                # Get RGB images from observation (support dual views)
+                rgb_static_tensor = obs["rgb_obs"]["rgb_static"]
+                rgb_gripper_tensor = obs["rgb_obs"].get("rgb_gripper")
+
+                def tensor_to_numpy(t):
+                    """Convert CLIP-normalized RGB tensor to numpy array [H, W, 3] uint8.
+
+                    The tensor is assumed to be normalized with CLIP statistics:
+                    - mean: [0.48145466, 0.4578275, 0.40821073]
+                    - std: [0.26862954, 0.26130258, 0.27577711]
+                    """
+                    # CLIP normalization constants
+                    CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073])
+                    CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711])
+
+                    # Handle different tensor shapes:
+                    # [B, T, C, H, W] -> take last frame from batch 0
+                    # [B, C, H, W] -> take batch 0
+                    # [C, H, W] -> use directly
+                    if t.dim() == 5:
+                        t = t[0, -1]  # [C, H, W] - batch 0, last frame
+                    elif t.dim() == 4:
+                        t = t[0]  # [C, H, W] - batch 0
+
+                    # Now t is [C, H, W], move to CPU
+                    t = t.cpu().float()
+
+                    # Denormalize: pixel = pixel * std + mean
+                    # Reshape mean/std for broadcasting: [C] -> [C, 1, 1]
+                    mean = CLIP_MEAN.view(3, 1, 1)
+                    std = CLIP_STD.view(3, 1, 1)
+                    t = t * std + mean
+
+                    # Convert to [H, W, C] and scale to [0, 255]
+                    t = t.permute(1, 2, 0)
+                    t = (t * 255).clamp(0, 255)
+
+                    return t.numpy().astype(np.uint8)
+
+                rgb_static_np = tensor_to_numpy(rgb_static_tensor)
+                rgb_gripper_np = tensor_to_numpy(rgb_gripper_tensor) if rgb_gripper_tensor is not None else None
+
+                # Get attention weights and selection counts
+                if last_attn_data is not None:
+                    attn_weights = last_attn_data.get("soft_weights")  # Continuous weights for smooth heatmap
+                    num_selected = last_attn_data.get("num_selected", 0)
+                    num_total = last_attn_data.get("num_total", 0)
+                else:
+                    attn_weights = None
+                    num_selected = 0
+                    num_total = 0
+
+                attn_visualizer.add_frame(
+                    rgb_static_np,
+                    attn_weights,
+                    num_selected,
+                    num_total,
+                    is_policy_step,
+                    rgb_gripper=rgb_gripper_np,
+                )
+
             obs, _, _, current_info = env.step(action)
             if cfg.debug:
                 img = env.render(mode="rgb_array")
